@@ -186,6 +186,17 @@ bun run typecheck
 bun run format
 ```
 
+### Service Install (user-space only)
+
+Production installs use `scripts/install.sh`, which is user-space-only: a
+per-user systemd unit (`systemctl --user`), default prefix
+`~/.local/share/opencode-telegram`, no root/sudo/`/opt`. The operator flow
+(flags, lingering, uninstall gating, migration off old system-wide
+installs) is documented in
+[README.md](README.md#install-as-a-user-service); `bash
+scripts/install.sh --help` is authoritative for flags. Keep exactly one
+service per bot token to avoid Telegram `409 Conflict` errors.
+
 ### Key Patterns
 
 - **Event-driven**: Orchestrator emits events, integration layer handles them

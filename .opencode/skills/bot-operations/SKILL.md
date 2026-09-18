@@ -25,7 +25,7 @@ systemd service (installed via `scripts/install.sh`, unit
 systemctl --user status opencode-telegram.service
 systemctl --user restart opencode-telegram.service
 systemctl --user stop opencode-telegram.service
-# Drop --user for --system installs. Add --user <name> scoping per install.sh --help.
+# User-space only: no --system mode, no sudo; the unit lives under ~/.config/systemd/user/.
 ```
 
 Docker:
@@ -48,8 +48,7 @@ tmux send-keys -t %368 'bun run dev' Enter   # start
 Pick the source that matches how the bot runs:
 
 - File mode: `data/bot.log` (present only when file logging is enabled).
-- systemd: `journalctl --user -u opencode-telegram.service -f`
-  (drop `--user` for `--system` installs).
+- systemd: `journalctl --user -u opencode-telegram.service -f`.
 - Docker: `docker logs -f opencode-telegram` or `docker compose logs -f`.
 - Dev/tmux: terminal output, or `tmux capture-pane -t %368 -p -S -200`.
 
@@ -68,11 +67,18 @@ A healthy bot answers the API health endpoint and shows active instances via
 - `bash scripts/setup-env.sh` — guided env setup; validates input, writes
   `.env` with restricted permissions; safe to re-run (backs up existing `.env`).
 - `bash scripts/install.sh --dry-run` — preview installer actions first.
-- `bash scripts/install.sh` — user service install (default).
-- `bash scripts/install.sh --help` — all flags (`--system`, `--prefix`,
-  `--env-from`, `--non-interactive`, `--uninstall`).
+- `bash scripts/install.sh` — user-space-only install (default prefix
+  `~/.local/share/opencode-telegram`; no root, no sudo, no `/opt`).
+- `bash scripts/install.sh --help` — all flags (`--prefix`, `--env-from`,
+  `--non-interactive`, `--uninstall`/`--yes`, `--dry-run`, `--allow-root`).
+  Old `--system` / `--user NAME` flags abort — re-run without them.
 - `bash scripts/install.sh --uninstall` — remove unit (keeps installed files
   unless `--yes` plus typed `DELETE` confirmation).
+- Migrating off an old system-wide install: keep exactly ONE service per
+  token (duplicates cause `409 Conflict`s). Fresh user-space install first,
+  then `sudo systemctl disable --now opencode-telegram.service`,
+  `sudo rm -f /etc/systemd/system/opencode-telegram.service && sudo systemctl daemon-reload`,
+  `sudo rm -rf /opt/opencode-telegram` (deletes its data/ — back up first).
 
 ## Stale / duplicate processes
 

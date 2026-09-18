@@ -24,7 +24,7 @@ A Telegram bot that orchestrates multiple [OpenCode](https://opencode.ai) instan
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Install as a System Service](#install-as-a-system-service)
+- [Install as a User Service](#install-as-a-user-service)
 - [Running with Docker](#running-with-docker)
 - [Usage](#usage)
 - [Troubleshooting](#troubleshooting)
@@ -91,20 +91,34 @@ bun run dev
 bun run start
 ```
 
-## Install as a System Service
+## Install as a User Service
 
-For a bot that survives logouts and restarts, install it as a systemd service:
+For a bot that survives logouts and restarts, install it as a per-user
+systemd service. The installer is user-space-only: no root, no sudo, no
+system-wide unit, nothing under `/opt`. It copies the repo to
+`~/.local/share/opencode-telegram` by default and runs the service as your
+own account via `systemctl --user`.
 
 ```bash
 # Preview what the installer will do (changes nothing)
 bash scripts/install.sh --dry-run
 
-# User service (default; runs as your user)
+# Install
 bash scripts/install.sh
 ```
 
-Run `bash scripts/install.sh --help` for all flags (system-wide install,
-custom prefix, headless install, uninstall).
+Run `bash scripts/install.sh --help` for all flags (`--prefix`,
+`--env-from`, `--non-interactive`, `--uninstall`/`--yes`, `--dry-run`,
+`--allow-root`). The old `--system` and `--user NAME` flags were removed
+and now abort with an error — just re-run without them.
+
+If the installer reports that lingering is off, enable it so the service
+starts on boot without a login (the installer offers this step, or prints
+the command under `--non-interactive`/`--dry-run`):
+
+```bash
+sudo loginctl enable-linger $USER
+```
 
 Check status, logs, and health:
 
@@ -113,6 +127,29 @@ systemctl --user is-active opencode-telegram.service
 journalctl --user -u opencode-telegram.service -f
 curl -s http://localhost:4200/api/health
 ```
+
+Uninstall:
+
+```bash
+bash scripts/install.sh --uninstall          # removes the unit, keeps installed files (incl. data/)
+bash scripts/install.sh --uninstall --yes    # also deletes the install prefix after typed DELETE confirmation
+```
+
+### Migrating from an old system-wide install
+
+Old system-mode installs leave root-owned leftovers the new installer will
+not touch. Keep exactly ONE service per bot token — two bot copies polling
+Telegram cause `409 Conflict` errors and flapping. Migrate with a fresh
+user-space install above, then remove the old pieces:
+
+```bash
+sudo systemctl disable --now opencode-telegram.service
+sudo rm -f /etc/systemd/system/opencode-telegram.service && sudo systemctl daemon-reload
+sudo rm -rf /opt/opencode-telegram   # deletes its data/ (chat/session DBs) — back up first if history matters
+```
+
+`--uninstall` prints these exact remediation lines automatically when it
+detects the leftovers.
 
 ## Running with Docker
 

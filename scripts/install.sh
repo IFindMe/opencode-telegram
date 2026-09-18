@@ -1,37 +1,44 @@
 #!/usr/bin/env bash
 #
-# install.sh — install the opencode-telegram bot as a systemd service so it
-# runs on boot without keeping a terminal (or this repo checkout) open.
+# install.sh — install the opencode-telegram bot as a per-user systemd service
+# so it runs on boot without keeping a terminal (or this repo checkout) open.
+#
+# USER-SPACE ONLY: this installer never needs root and never uses sudo for
+# the install itself. Everything lives under your own account and the service
+# runs via `systemctl --user` as that same account — so installed files
+# (including data/*.db) are always writable by the service, by construction.
+# There is no system-wide mode: a `--system` flag from an older version is
+# rejected with an error (see argument parsing below).
 #
 # What it does:
 #   1. Copies the runtime files (src/, package.json, bun.lock*, scripts/,
 #      .env.example, README.md, LICENSE) from this repo into an install
-#      prefix OUTSIDE the checkout, so the installed copy survives
+#      prefix OUTSIDE the checkout (default
+#      $HOME/.local/share/opencode-telegram), so the installed copy survives
 #      independent of the source repo.
 #   2. Runs `bun install` in the installed copy and creates its data/ dir.
 #   3. Provides the installed copy's .env (copies --env-from, defaulting to
 #      this repo's .env when present; otherwise runs the installed copy's
 #      scripts/setup-env.sh interactively).
-#   4. Writes a systemd unit (user service by default) and enables+starts it.
-#
-# Modes:
-#   user   (default) — `systemctl --user` unit in
-#                       ~/.config/systemd/user/, no root needed.
-#   system (--system) — unit in /etc/systemd/system/, requires root/sudo and
-#                       --user NAME (the account the service runs as).
+#   4. Writes a per-user systemd unit in ~/.config/systemd/user/ and
+#      enables+starts it via `systemctl --user`.
 #
 # Examples:
 #   bash scripts/install.sh
 #   bash scripts/install.sh --dry-run
 #   bash scripts/install.sh --prefix /tmp/oc-tg-test --dry-run
-#   bash scripts/install.sh --system --user alice
 #   bash scripts/install.sh --env-from /path/to/.env --non-interactive
 #   bash scripts/install.sh --uninstall
-#   bash scripts/install.sh --system --uninstall --yes
+#   bash scripts/install.sh --uninstall --yes
 #
 # Re-running is safe (idempotent): the existing unit and .env are backed up
 # with a timestamp suffix before being replaced. Secrets are never printed
 # (a token is shown only as its last 4 characters, like setup-env.sh).
+#
+# Coming from an OLD system-wide install? This script only manages the
+# per-user unit/prefix above. On uninstall it points out stale root-owned
+# leftovers (old /opt prefix, old /etc unit) with the exact command you can
+# run yourself to remove them — it never uses sudo on your behalf.
 
 set -euo pipefail
 
@@ -40,19 +47,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 SERVICE_NAME="opencode-telegram.service"
-INSTALL_SCRIPT_ABS="$REPO_ROOT/scripts/install.sh"
 
-MODE="user"
+# Leftovers from pre-user-space-only (system-mode) installs. This script
+# never writes, deletes, or chowns these paths — it only reports them.
+LEGACY_SYSTEM_UNIT="/etc/systemd/system/${SERVICE_NAME}"
+LEGACY_SYSTEM_PREFIX="/opt/opencode-telegram"
+
 PREFIX=""
 ENV_FROM=""
 ENV_FROM_GIVEN="false"
-SYSTEM_USER=""
 NON_INTERACTIVE="false"
 UNINSTALL="false"
 DRY_RUN="false"
 ASSUME_YES="false"
 SHOW_HELP="false"
-ORIG_ARGS=("$@")
+ALLOW_ROOT="false"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,18 +129,14 @@ usage() {
   cat <<'EOF'
 Usage: scripts/install.sh [OPTIONS]
 
-Install the opencode-telegram bot as a systemd service (user service by
-default), from an independent copy outside this repo checkout.
+Install the opencode-telegram bot as a per-user systemd service
+(systemctl --user), from an independent copy outside this repo checkout.
+User-space-only: no root, no sudo, no system-wide unit. The service runs as
+your own account, so it can always write its own files (incl. data/*.db).
 
 Options:
-  --system            Install a system-wide unit in /etc/systemd/system
-                      (requires root/sudo and --user NAME). Default is a
-                      per-user unit (systemctl --user), no root needed.
-  --user NAME         Account the system-wide service runs as (User=/Group=
-                      in the unit). Required with --system; ignored otherwise.
-  --prefix PATH       Install prefix (must be absolute). Defaults:
-                      user mode:   $HOME/.local/share/opencode-telegram
-                      system mode: /opt/opencode-telegram
+  --prefix PATH       Install prefix (must be absolute).
+                      Default: $HOME/.local/share/opencode-telegram
   --env-from PATH     Copy this .env file to <prefix>/.env (mode 600).
                       Default: this repo's .env, when present. Otherwise the
                       installed copy's scripts/setup-env.sh runs
@@ -139,30 +144,38 @@ Options:
   --non-interactive   Never prompt. Aborts instead of running setup-env.sh
                       when no .env source exists, and skips the lingering
                       offer (prints the manual command instead).
-  --uninstall         Stop+disable the service and remove its unit file.
+  --uninstall         Stop+disable the user service and remove its unit file.
                       Installed files (<prefix>, incl. data/) are kept unless
                       --yes is ALSO given AND deletion is confirmed.
   --yes, -y           With --uninstall: allow deleting <prefix> (still asks
                       for typed DELETE confirmation unless --non-interactive
                       or --dry-run). Without --yes nothing is ever deleted.
   --dry-run           Print every mutation that would happen; change nothing.
+  --allow-root        Permit running as root (containers without a login
+                      user only). Without it, running as root aborts: a
+                      user-space install into /root is almost never wanted.
   --help, -h          Show this help and exit.
+
+Removed flags (abort with an error if passed):
+  --system, --user NAME
+                      System-wide installs were removed. Your service runs
+                      via `systemctl --user` as your own account — just
+                      re-run without these flags.
 
 Examples:
   bash scripts/install.sh
   bash scripts/install.sh --dry-run
-  bash scripts/install.sh --system --user alice
   bash scripts/install.sh --env-from /path/to/.env --non-interactive
   bash scripts/install.sh --uninstall
-  bash scripts/install.sh --system --uninstall --yes
+  bash scripts/install.sh --uninstall --yes
 EOF
 }
 
 # resolve_bun — print an absolute path to the bun binary, or fail.
-# Tries PATH first, then common install locations, then (under sudo) the
-# invoking user's bun home. Read-only: safe under --dry-run.
+# Tries PATH first, then common install locations.
+# Read-only: safe under --dry-run.
 resolve_bun() {
-  local found="" cand="" home_dir=""
+  local found="" cand=""
   if found="$(command -v bun 2>/dev/null || true)"; then
     if [[ -n "$found" && "$found" == */* ]]; then
       printf '%s' "$found"
@@ -175,13 +188,6 @@ resolve_bun() {
       return 0
     fi
   done
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
-    home_dir="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
-    if [[ -n "$home_dir" && -x "$home_dir/.bun/bin/bun" ]]; then
-      printf '%s' "$home_dir/.bun/bin/bun"
-      return 0
-    fi
-  fi
   return 1
 }
 
@@ -191,7 +197,12 @@ resolve_bun() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --system) MODE="system"; shift ;;
+    --system)
+      die "system mode removed: this installer is user-space-only; your service runs via \`systemctl --user\` as your own account. Re-run without --system." ;;
+    --user)
+      die "--user NAME was removed with system mode: this installer is user-space-only and runs as your own account. Re-run without --user." ;;
+    --user=*)
+      die "--user NAME was removed with system mode: this installer is user-space-only and runs as your own account. Re-run without --user." ;;
     --prefix)
       [[ $# -ge 2 ]] || die "--prefix needs a PATH argument (see --help)."
       [[ -n "${2:-}" ]] || die "--prefix needs a non-empty PATH argument."
@@ -206,15 +217,11 @@ while [[ $# -gt 0 ]]; do
     --env-from=*)
       [[ -n "${1#--env-from=}" ]] || die "--env-from needs a non-empty PATH argument."
       ENV_FROM="${1#--env-from=}"; ENV_FROM_GIVEN="true"; shift ;;
-    --user)
-      [[ $# -ge 2 ]] || die "--user needs a NAME argument (see --help)."
-      SYSTEM_USER="$2"; shift 2 ;;
-    --user=*)
-      SYSTEM_USER="${1#--user=}"; shift ;;
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
     --uninstall) UNINSTALL="true"; shift ;;
     --dry-run) DRY_RUN="true"; shift ;;
     --yes|-y) ASSUME_YES="true"; shift ;;
+    --allow-root) ALLOW_ROOT="true"; shift ;;
     --help|-h) SHOW_HELP="true"; shift ;;
     --) shift; break ;;
     -*) die "Unknown flag: $1 (see --help)." ;;
@@ -225,6 +232,13 @@ done
 if [[ "$SHOW_HELP" == "true" ]]; then
   usage
   exit 0
+fi
+
+# A user-space installer run as root would install into /root and recreate
+# exactly the account-confusion this script exists to avoid. Fail fast,
+# unless explicitly overridden for containers without a login user.
+if [[ "${EUID:-$(id -u)}" -eq 0 && "$ALLOW_ROOT" != "true" ]]; then
+  die "Refusing to run as root: this installer is user-space-only and would install into /root. Re-run as your normal user (the account that will run the service via 'systemctl --user'). Containers without a login user may re-run with --allow-root."
 fi
 
 if [[ -n "$PREFIX" && "$PREFIX" != /* ]]; then
@@ -238,45 +252,14 @@ if [[ -n "$ENV_FROM" && "$ENV_FROM" != /* ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Mode setup
+# User-space layout (the only flow — no system mode, no root paths)
 # ---------------------------------------------------------------------------
 
-UNIT_PATH=""
-WANTED_BY=""
-SYSCTL=()
-JCTL=()
-
-if [[ "$MODE" == "system" ]]; then
-  [[ -n "$PREFIX" ]] || PREFIX="/opt/opencode-telegram"
-  UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}"
-  WANTED_BY="multi-user.target"
-  SYSCTL=(systemctl)
-  JCTL=(journalctl)
-  [[ -n "$SYSTEM_USER" ]] || die "--system mode requires --user NAME (the account the service runs as)."
-  id "$SYSTEM_USER" >/dev/null 2>&1 || die "User '$SYSTEM_USER' does not exist."
-  if [[ -n "${SUDO_USER:-}" || "${EUID:-$(id -u)}" -eq 0 ]]; then
-    : # already root (or root-adjacent) — proceed
-  else
-    if [[ "$DRY_RUN" == "true" ]]; then
-      warn "--system mode needs root; [dry-run] skipping the sudo re-exec (a real run would re-exec via sudo)."
-    elif command -v sudo >/dev/null 2>&1; then
-      log "Re-executing via sudo for the system-wide install..."
-      # shellcheck disable=SC2096
-      exec sudo "$INSTALL_SCRIPT_ABS" "${ORIG_ARGS[@]}"
-    else
-      die "--system mode requires root. Re-run with sudo/as root, or sudo is not installed."
-    fi
-  fi
-else
-  [[ -n "$PREFIX" ]] || PREFIX="$HOME/.local/share/opencode-telegram"
-  UNIT_PATH="$HOME/.config/systemd/user/${SERVICE_NAME}"
-  WANTED_BY="default.target"
-  SYSCTL=(systemctl --user)
-  JCTL=(journalctl --user)
-  if [[ -n "$SYSTEM_USER" ]]; then
-    warn "Ignoring --user '$SYSTEM_USER' (only meaningful with --system)."
-  fi
-fi
+[[ -n "$PREFIX" ]] || PREFIX="$HOME/.local/share/opencode-telegram"
+UNIT_PATH="$HOME/.config/systemd/user/${SERVICE_NAME}"
+WANTED_BY="default.target"
+SYSCTL=(systemctl --user)
+JCTL=(journalctl --user)
 
 if [[ "$ENV_FROM_GIVEN" == "true" ]]; then
   [[ -f "$ENV_FROM" ]] || die "--env-from file not found: $ENV_FROM"
@@ -297,10 +280,36 @@ fi
 # Uninstall path
 # ---------------------------------------------------------------------------
 
+# note_stale_leftover PATH REMEDIATION — report a leftover from a
+# pre-user-space-only (system-mode) install. Never touches it and never uses
+# sudo: if it is removable as this user we say so (and still leave it in
+# place — deletion gating applies to --prefix only); otherwise we print the
+# exact one-line command the user can run themselves, then continue.
+note_stale_leftover() {
+  local path="$1" remediation="$2" self_rm="rm -f"
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+  if [[ -d "$path" ]]; then
+    self_rm="rm -rf"
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf '[dry-run] would check stale leftover (read-only): %s\n' "$path"
+    return 0
+  fi
+  if [[ -w "$path" && -w "$(dirname "$path")" ]]; then
+    log "Leftover from an old install exists (left in place): $path"
+    log "  It is removable as '$(id -un)' — delete it yourself if unneeded: $self_rm -- $path"
+  else
+    warn "Stale leftover from an old system-mode install is not removable as '$(id -un)': $path"
+    log "  To remove it yourself, run: $remediation"
+  fi
+}
+
 do_uninstall() {
   local stamp=""
   stamp="$(date +%Y%m%d-%H%M%S)"
-  log "Uninstalling ${SERVICE_NAME} (${MODE} mode)..."
+  log "Uninstalling ${SERVICE_NAME} (per-user service)..."
   log "  unit:   $UNIT_PATH"
   log "  prefix: $PREFIX"
 
@@ -319,29 +328,33 @@ do_uninstall() {
     log "Keeping installed files at: $PREFIX"
     log "To also delete them (including data/), re-run with --uninstall --yes"
     log "(you will still be asked to type DELETE to confirm)."
-    return 0
+  else
+    # --yes given: still require typed confirmation, unless --non-interactive
+    # (explicit --yes alone is then enough) or --dry-run (prints only).
+    if [[ -z "$PREFIX" || "$PREFIX" == "/" || "$PREFIX" == "$HOME" ]]; then
+      die "Refusing to delete unsafe prefix: '${PREFIX:-}'."
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+      printf '[dry-run] would ask for typed DELETE confirmation, then run: rm -rf -- %q\n' "$PREFIX"
+    else
+      if [[ "$NON_INTERACTIVE" != "true" ]]; then
+        local confirm=""
+        read -r -p "Type DELETE to permanently delete ${PREFIX} (including data/): " confirm || confirm=""
+        [[ "$confirm" == "DELETE" ]] || die "Aborted — installed files kept at $PREFIX."
+      fi
+      if [[ -e "$PREFIX" ]]; then
+        run rm -rf -- "$PREFIX"
+        log "Deleted $PREFIX."
+      else
+        log "Nothing to delete: $PREFIX does not exist."
+      fi
+    fi
   fi
 
-  # --yes given: still require typed confirmation, unless --non-interactive
-  # (explicit --yes alone is then enough) or --dry-run (prints only).
-  if [[ -z "$PREFIX" || "$PREFIX" == "/" || "$PREFIX" == "$HOME" ]]; then
-    die "Refusing to delete unsafe prefix: '${PREFIX:-}'."
-  fi
-  if [[ "$DRY_RUN" == "true" ]]; then
-    printf '[dry-run] would ask for typed DELETE confirmation, then run: rm -rf -- %q\n' "$PREFIX"
-    return 0
-  fi
-  if [[ "$NON_INTERACTIVE" != "true" ]]; then
-    local confirm=""
-    read -r -p "Type DELETE to permanently delete ${PREFIX} (including data/): " confirm || confirm=""
-    [[ "$confirm" == "DELETE" ]] || die "Aborted — installed files kept at $PREFIX."
-  fi
-  if [[ -e "$PREFIX" ]]; then
-    run rm -rf -- "$PREFIX"
-    log "Deleted $PREFIX."
-  else
-    log "Nothing to delete: $PREFIX does not exist."
-  fi
+  # Stale root-owned leftovers from an old system-mode install are NOT
+  # touched (no sudo): report them with a self-serve remediation instead.
+  note_stale_leftover "$LEGACY_SYSTEM_UNIT" "sudo rm -f ${LEGACY_SYSTEM_UNIT} && sudo systemctl daemon-reload"
+  note_stale_leftover "$LEGACY_SYSTEM_PREFIX" "sudo rm -rf ${LEGACY_SYSTEM_PREFIX}"
 }
 
 if [[ "$UNINSTALL" == "true" ]]; then
@@ -468,26 +481,10 @@ configure_env() {
   run bash "$PREFIX/scripts/setup-env.sh"
 }
 
-fix_ownership() {
-  # System mode runs everything above as root, leaving PREFIX (incl. data/
-  # and .env) root-owned. The service runs as $SYSTEM_USER, which then cannot
-  # write data/*.db — SQLite fails with "unable to open database file".
-  # Hand the whole tree to the service account (no-op in user mode).
-  if [[ "$MODE" == "system" ]]; then
-    local grp=""
-    grp="$(id -gn "$SYSTEM_USER")"
-    log "Setting ownership of $PREFIX to ${SYSTEM_USER}:${grp} ..."
-    run chown -R "${SYSTEM_USER}:${grp}" "$PREFIX"
-  fi
-}
-
 write_unit() {
-  local unit_dir="" stamp="" content="" grp=""
+  local unit_dir="" stamp="" content=""
   unit_dir="$(dirname "$UNIT_PATH")"
   stamp="$(date +%Y%m%d-%H%M%S)"
-  if [[ "$MODE" == "system" ]]; then
-    grp="$(id -gn "$SYSTEM_USER")"
-  fi
 
   content="# Generated by scripts/install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
   content+=$'\n'"# Re-running scripts/install.sh is safe (this file is backed up first)."
@@ -504,10 +501,6 @@ write_unit() {
   content+=$'\n'"Restart=always"
   content+=$'\n'"RestartSec=5"
   content+=$'\n'"NoNewPrivileges=true"
-  if [[ "$MODE" == "system" ]]; then
-    content+=$'\n'"User=${SYSTEM_USER}"
-    content+=$'\n'"Group=${grp}"
-  fi
   content+=$'\n'""
   content+=$'\n'"[Install]"
   content+=$'\n'"WantedBy=${WANTED_BY}"
@@ -531,32 +524,30 @@ enable_and_check() {
   run "${SYSCTL[@]}" daemon-reload
   run "${SYSCTL[@]}" enable --now "$SERVICE_NAME"
 
-  if [[ "$MODE" == "user" ]]; then
-    me="${USER:-$(id -un)}"
-    linger_out=""
-    if command -v loginctl >/dev/null 2>&1; then
-      linger_out="$(loginctl show-user "$me" -p Linger 2>/dev/null || true)"
-    fi
-    if [[ "$linger_out" != *"=yes"* ]]; then
-      warn "User lingering is not enabled (${linger_out:-unknown}) — the user service may not start on boot until you log in once."
-      if [[ "$DRY_RUN" == "true" ]]; then
-        printf '[dry-run] would offer: sudo loginctl enable-linger %s\n' "$me"
-      elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-        log "Non-interactive: enable lingering manually: sudo loginctl enable-linger $me"
-      else
-        ans=""
-        read -r -p "Enable lingering now via 'sudo loginctl enable-linger $me'? [y/N]: " ans || ans=""
-        if [[ "$ans" =~ ^[Yy]$ ]]; then
-          run sudo loginctl enable-linger "$me"
-        else
-          log "Skipped. Enable later with: sudo loginctl enable-linger $me"
-        fi
-      fi
-    else
-      log "User lingering is enabled — the service will start on boot."
-    fi
-    log "Service start was requested now regardless of lingering."
+  me="${USER:-$(id -un)}"
+  linger_out=""
+  if command -v loginctl >/dev/null 2>&1; then
+    linger_out="$(loginctl show-user "$me" -p Linger 2>/dev/null || true)"
   fi
+  if [[ "$linger_out" != *"=yes"* ]]; then
+    warn "User lingering is not enabled (${linger_out:-unknown}) — the user service may not start on boot until you log in once."
+    if [[ "$DRY_RUN" == "true" ]]; then
+      printf '[dry-run] would offer: sudo loginctl enable-linger %s\n' "$me"
+    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+      log "Non-interactive: enable lingering manually: sudo loginctl enable-linger $me"
+    else
+      ans=""
+      read -r -p "Enable lingering now via 'sudo loginctl enable-linger $me'? [y/N]: " ans || ans=""
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        run sudo loginctl enable-linger "$me"
+      else
+        log "Skipped. Enable later with: sudo loginctl enable-linger $me"
+      fi
+    fi
+  else
+    log "User lingering is enabled — the service will start on boot."
+  fi
+  log "Service start was requested now regardless of lingering."
 
   if [[ "$DRY_RUN" == "true" ]]; then
     printf '[dry-run] would check:'
@@ -585,9 +576,8 @@ enable_and_check() {
 copy_runtime_files
 install_deps
 configure_env
-fix_ownership
 write_unit
 enable_and_check
 
 log ""
-log "Done. Mode: ${MODE}. Prefix: ${PREFIX}. Unit: ${UNIT_PATH}."
+log "Done. User-space install. Prefix: ${PREFIX}. Unit: ${UNIT_PATH}."
