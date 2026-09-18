@@ -468,6 +468,19 @@ configure_env() {
   run bash "$PREFIX/scripts/setup-env.sh"
 }
 
+fix_ownership() {
+  # System mode runs everything above as root, leaving PREFIX (incl. data/
+  # and .env) root-owned. The service runs as $SYSTEM_USER, which then cannot
+  # write data/*.db — SQLite fails with "unable to open database file".
+  # Hand the whole tree to the service account (no-op in user mode).
+  if [[ "$MODE" == "system" ]]; then
+    local grp=""
+    grp="$(id -gn "$SYSTEM_USER")"
+    log "Setting ownership of $PREFIX to ${SYSTEM_USER}:${grp} ..."
+    run chown -R "${SYSTEM_USER}:${grp}" "$PREFIX"
+  fi
+}
+
 write_unit() {
   local unit_dir="" stamp="" content="" grp=""
   unit_dir="$(dirname "$UNIT_PATH")"
@@ -572,6 +585,7 @@ enable_and_check() {
 copy_runtime_files
 install_deps
 configure_env
+fix_ownership
 write_unit
 enable_and_check
 
