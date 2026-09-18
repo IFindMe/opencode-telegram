@@ -28,6 +28,7 @@ import {
 import { 
   OpenCodeClient, 
   StreamHandler,
+  buildTelegramSystemPrompt,
   discoverSessions,
   isPortAlive,
   findSession,
@@ -99,6 +100,20 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
 
   // Map of sessionId → instanceId for reverse lookup
   const sessionToInstance = new Map<string, string>()
+
+  // H3: last accepted prompt per topic (set on prompt_async 2xx, cleared on
+  // session idle). hadActive is set on the first SSE event for the session so
+  // the restart notice survives crash-path state purges (F1: streamHandler
+  // states are wiped by unregisterSession before instance:ready runs).
+  const lastPromptByTopic = new Map<number, { text: string; sessionId: string; at: number; hadActive: boolean }>()
+  // H3/H5: last known session per topic, to detect superseded sessionIds.
+  const lastSessionByTopic = new Map<number, string>()
+
+  // Telegram-context system prompt: sessionIds of freshly bot-created sessions
+  // still needing the one-time `system` injection on their first prompt_async.
+  // Populated ONLY in the instance:ready creation branch below — never for
+  // found-existing, discovered, TUI, or external sessions.
+  const systemPromptPending = new Set<string>()
 
   // Rate limit state for Telegram API
   let rateLimitedUntil = 0
@@ -217,6 +232,11 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
 
   // Set up session idle callback to update topic names after first message
   streamHandler.setOnSessionIdle(async (sessionId, chatId, topicId) => {
+    // H3: response completed — the tracked prompt is no longer orphanable.
+    const tracked = lastPromptByTopic.get(topicId)
+    if (tracked && tracked.sessionId === sessionId) {
+      lastPromptByTopic.delete(topicId)
+    }
     // Only update once per session
     if (topicNamesUpdated.has(sessionId)) {
       return
@@ -298,6 +318,76 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       }
     }
     return null
+  }
+
+  // H1: targeted Telegram notice on unrecoverable SSE loss — never log-only.
+  // Resolves affected topic(s) from the instance + session registrations.
+  async function notifySseLoss(instanceKey: string, error: unknown): Promise<void> {
+    const errMsg = error instanceof Error ? error.message : String(error)
+    console.error(`[Integration] SSE unrecoverable for ${instanceKey}:`, errMsg)
+    const topicIds = new Set<number>()
+    if (instanceKey.startsWith("discovered_")) {
+      const tid = parseInt(instanceKey.slice("discovered_".length), 10)
+      if (Number.isFinite(tid)) topicIds.add(tid)
+    }
+    const inst = instanceManager.getInstance(instanceKey)
+    if (inst) topicIds.add(inst.config.topicId)
+    for (const [sid, iid] of sessionToInstance) {
+      if (iid === instanceKey) {
+        const dest = streamHandler.getTelegramDestination(sid)
+        if (dest) topicIds.add(dest.topicId)
+      }
+    }
+    if (topicIds.size === 0) return
+    const chatId = config.telegram.chatId
+    for (const topicId of topicIds) {
+      try {
+        await sendToTopic(
+          bot,
+          chatId,
+          topicId,
+          `⚠️ Lost live connection to OpenCode (${errMsg.slice(0, 120)}).\n\n` +
+          `Your last message may not complete. Check /status in General — a restart may be needed to restore live updates.`
+        )
+      } catch (notifyError) {
+        console.error(`[Integration] Failed to send SSE-loss notice to topic ${topicId}:`, notifyError)
+      }
+    }
+  }
+
+  // F1: extract the sessionId from an SSE event (same locations as
+  // StreamHandler.handleEvent) so the H3 liveness flag survives state purges.
+  function extractSseSessionId(sseEvent: SSEEvent): string | null {
+    const props = sseEvent.properties as Record<string, any>
+    return (
+      props.sessionID ||
+      props.info?.sessionID ||
+      props.part?.sessionID ||
+      props.permission?.sessionID ||
+      null
+    )
+  }
+
+  // F1: persistently record that a tracked prompt produced stream activity.
+  // Lives on lastPromptByTopic (not streamHandler states) so the crash-path
+  // purge (unregisterSession) cannot wipe it before instance:ready runs.
+  function markPromptHadActivity(sessionId: string): void {
+    for (const entry of lastPromptByTopic.values()) {
+      if (entry.sessionId === sessionId) entry.hadActive = true
+    }
+  }
+
+  // H5: drop superseded sessionIds for an instance, keeping sessionToInstance
+  // and the stream handler in sync. Returns retired sessionIds.
+  function retireSupersededSessions(instanceId: string, keepSessionId: string): string[] {    const retired: string[] = []
+    for (const [sid, iid] of Array.from(sessionToInstance.entries())) {
+      if (iid === instanceId && sid !== keepSessionId) {
+        sessionToInstance.delete(sid)
+        streamHandler.unregisterSession(sid)
+        retired.push(sid)
+      }
+    }
+    return retired
   }
 
   // Create OpenCode client adapter for TopicManager
@@ -406,13 +496,36 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
 
         // If no matching session found, create a new one
         if (!sessionId) {
-          const session = await client.createSession()
+          const projectTitle = instanceInfo?.config.name
+          const session = await client.createSession(projectTitle ? { title: projectTitle } : undefined)
           sessionId = session.id
+          // Freshly bot-created: needs the one-time Telegram system prompt
+          // injection on its first prompt_async (managed send path below).
+          systemPromptPending.add(sessionId)
           console.log(`[Integration] Created new session ${sessionId}`)
         }
 
+        // H3/H5: capture the previous session for this topic before overwriting,
+        // so a restart with a NEW sessionId can surface an orphaned prompt.
+        const readyTopicId = instanceInfo?.config.topicId
+        const prevSessionForTopic =
+          readyTopicId !== undefined ? lastSessionByTopic.get(readyTopicId) : undefined
+
+        // F1: snapshot liveness BEFORE retireSupersededSessions (which calls
+        // unregisterSession → deletes streamHandler states). Reading states
+        // after any unregister is always false, which made the H3 notice
+        // unreachable. (Does not cover the crash path — those states were
+        // purged by the earlier instance:crashed event — hence the persistent
+        // pending.hadActive flag below.)
+        const prevHadActiveSnapshot = prevSessionForTopic
+          ? streamHandler.getState(prevSessionForTopic) !== undefined ||
+            streamHandler.isProcessing(prevSessionForTopic)
+          : false
+
         // Track session → instance mapping
         sessionToInstance.set(sessionId, event.instanceId)
+        // H5: drop any other sessionIds still pointing at this instance.
+        retireSupersededSessions(event.instanceId, sessionId)
         
         // Update the instance's sessionId in the orchestrator
         // This is important so that createTopicWithInstance can wait for it
@@ -456,18 +569,54 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         const abort = client.subscribe(
           (sseEvent: SSEEvent) => {
             console.log(`[Integration] SSE event: ${sseEvent.type}`, JSON.stringify(sseEvent.properties).slice(0, 200))
+            // F1: record stream liveness on the tracked prompt (survives the
+            // crash/ready state purges that wipe streamHandler states).
+            const evtSessionId = extractSseSessionId(sseEvent)
+            if (evtSessionId) markPromptHadActivity(evtSessionId)
             streamHandler.handleEvent(sseEvent)
             
             // Record activity on any event
             instanceManager.recordActivity(event.instanceId)
           },
           (error) => {
-            console.error(`[Integration] SSE error for ${event.instanceId}:`, error)
+            // H1: client already retried with backoff — this is unrecoverable,
+            // so notify the affected topic(s) instead of logging only.
+            void notifySseLoss(event.instanceId, error)
           }
         )
         sseSubscriptions.set(event.instanceId, abort)
 
         console.log(`[Integration] Instance ${event.instanceId} ready with session ${sessionId}`)
+
+        // H3: if the restart produced a NEW session while a recent prompt on
+        // the old session never completed, tell the user to resend — never silent.
+        // H5: unregister the superseded sessionId and record the new one.
+        if (readyTopicId !== undefined) {
+          if (prevSessionForTopic && prevSessionForTopic !== sessionId) {
+            streamHandler.unregisterSession(prevSessionForTopic)
+            const pending = lastPromptByTopic.get(readyTopicId)
+            const recent = !!pending && Date.now() - pending.at < 10 * 60 * 1000
+            // F1: hadActive combines the pre-unregister snapshot with the
+            // persistent per-prompt flag (the flag covers the crash path, where
+            // states were already purged long before instance:ready runs).
+            // Notice-only: no auto-resend (duplicate-prompt risk).
+            const hadActive = prevHadActiveSnapshot || pending?.hadActive === true
+            if (recent && hadActive) {
+              try {
+                await sendToTopic(
+                  bot,
+                  config.telegram.chatId,
+                  readyTopicId,
+                  `🔄 OpenCode restarted and your last message may not have completed. ` +
+                  `Please resend it if no response appears.`
+                )
+              } catch (notifyError) {
+                console.error(`[Integration] Failed to send restart notice to topic ${readyTopicId}:`, notifyError)
+              }
+            }
+          }
+          lastSessionByTopic.set(readyTopicId, sessionId)
+        }
         break
       }
 
@@ -487,11 +636,12 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           clients.delete(event.instanceId)
         }
 
-        // Clean up session mapping
-        for (const [sessionId, instId] of sessionToInstance) {
+        // Clean up session mapping (H5: remove ALL stale entries, keep the
+        // stream handler in sync so no superseded session stays registered)
+        for (const [staleSessionId, instId] of Array.from(sessionToInstance.entries())) {
           if (instId === event.instanceId) {
-            sessionToInstance.delete(sessionId)
-            break
+            sessionToInstance.delete(staleSessionId)
+            streamHandler.unregisterSession(staleSessionId)
           }
         }
 
@@ -565,6 +715,8 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           streamHandler.markMessageFromTelegram(mapping.sessionId, text)
           await discoveredClient.sendMessageAsync(mapping.sessionId, text)
           console.log(`[Integration] Sent message to discovered session ${mapping.sessionId}`)
+          // H3: track last accepted prompt for orphan detection on restart.
+          lastPromptByTopic.set(effectiveTopicId, { text, sessionId: mapping.sessionId, at: Date.now(), hadActive: false })
           return { success: true, sessionId: mapping.sessionId }
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error)
@@ -603,10 +755,13 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
               const newAbort = newClient.subscribe(
                 (sseEvent: SSEEvent) => {
                   console.log(`[Integration] SSE event from reconnected session:`, sseEvent.type)
+                  const evtSessionId = extractSseSessionId(sseEvent)
+                  if (evtSessionId) markPromptHadActivity(evtSessionId)
                   streamHandler.handleEvent(sseEvent)
                 },
                 (error) => {
-                  console.error(`[Integration] SSE error for reconnected session:`, error)
+                  // H1: unrecoverable after client backoff — notify the topic.
+                  void notifySseLoss(discoveredKey, error)
                 }
               )
               
@@ -616,6 +771,9 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
               
               // Update the mapping if session ID changed
               if (reconnectSession.id !== mapping.sessionId) {
+                // H5: unregister the superseded sessionId; keep the maps in sync.
+                streamHandler.unregisterSession(mapping.sessionId)
+                sessionToInstance.delete(mapping.sessionId)
                 topicStore.deleteMapping(chatId, effectiveTopicId)
                 topicStore.createMapping(chatId, effectiveTopicId, mapping.topicName, reconnectSession.id, {
                   creatorUserId: mapping.creatorUserId,
@@ -634,6 +792,8 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
                 streamHandler.markMessageFromTelegram(reconnectSession.id, text)
                 await newClient.sendMessageAsync(reconnectSession.id, text)
                 console.log(`[Integration] Reconnected and sent message to session ${reconnectSession.id}`)
+                // H3: track last accepted prompt for orphan detection on restart.
+                lastPromptByTopic.set(effectiveTopicId, { text, sessionId: reconnectSession.id, at: Date.now(), hadActive: false })
                 
                 // Notify user of successful reconnection
                 await sendToTopic(bot, chatId, effectiveTopicId, 
@@ -694,10 +854,13 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         const newAbort = newClient.subscribe(
           (sseEvent: SSEEvent) => {
             console.log(`[Integration] SSE event from reconnected TUI:`, sseEvent.type)
+            const evtSessionId = extractSseSessionId(sseEvent)
+            if (evtSessionId) markPromptHadActivity(evtSessionId)
             streamHandler.handleEvent(sseEvent)
           },
           (error) => {
-            console.error(`[Integration] SSE error for reconnected TUI:`, error)
+            // H1: unrecoverable after client backoff — notify the topic.
+            void notifySseLoss(discoveredKey, error)
           }
         )
         
@@ -707,6 +870,9 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         
         // Update the mapping if session ID changed
         if (existingSession.id !== mapping.sessionId) {
+          // H5: unregister the superseded sessionId; keep the maps in sync.
+          streamHandler.unregisterSession(mapping.sessionId)
+          sessionToInstance.delete(mapping.sessionId)
           topicStore.deleteMapping(chatId, effectiveTopicId)
           topicStore.createMapping(chatId, effectiveTopicId, mapping.topicName, existingSession.id, {
             creatorUserId: mapping.creatorUserId,
@@ -725,6 +891,8 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           streamHandler.markMessageFromTelegram(existingSession.id, text)
           await newClient.sendMessageAsync(existingSession.id, text)
           console.log(`[Integration] Connected to existing TUI and sent message to session ${existingSession.id}`)
+          // H3: track last accepted prompt for orphan detection on restart.
+          lastPromptByTopic.set(effectiveTopicId, { text, sessionId: existingSession.id, at: Date.now(), hadActive: false })
           
           await sendToTopic(bot, chatId, effectiveTopicId, 
             "🔄 Reconnected to OpenCode TUI."
@@ -788,10 +956,23 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     instanceManager.recordActivity(instance.config.instanceId)
 
     // Send message asynchronously
+    // One-time Telegram-context system prompt: only for freshly bot-created
+    // sessions (managed path only — never discovered/TUI/external branches
+    // above). Marked injected only after the await resolves (2xx) so a
+    // failure retries injection on the next message.
+    const injectSystemPrompt = systemPromptPending.has(currentInstance.sessionId)
+    const systemOption = injectSystemPrompt
+      ? { system: buildTelegramSystemPrompt(topicName) }
+      : undefined
     try {
       // Mark this message as coming from Telegram so we don't echo it back
       streamHandler.markMessageFromTelegram(currentInstance.sessionId, text)
-      await client.sendMessageAsync(currentInstance.sessionId, text)
+      await client.sendMessageAsync(currentInstance.sessionId, text, systemOption)
+      if (injectSystemPrompt) {
+        systemPromptPending.delete(currentInstance.sessionId)
+      }
+      // H3: track last accepted prompt for orphan detection on restart.
+      lastPromptByTopic.set(effectiveTopicId, { text, sessionId: currentInstance.sessionId, at: Date.now(), hadActive: false })
       return { success: true, sessionId: currentInstance.sessionId }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
@@ -946,10 +1127,13 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         const abort = client.subscribe(
           (sseEvent: SSEEvent) => {
             console.log(`[Integration] SSE event from discovered session:`, sseEvent.type)
+            const evtSessionId = extractSseSessionId(sseEvent)
+            if (evtSessionId) markPromptHadActivity(evtSessionId)
             streamHandler.handleEvent(sseEvent)
           },
           (error) => {
-            console.error(`[Integration] SSE error for discovered session:`, error)
+            // H1: unrecoverable after client backoff — notify the topic.
+            void notifySseLoss(`discovered_${topicId}`, error)
           }
         )
 
@@ -1515,10 +1699,44 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           console.log(`[Integration] Looking for discovered client with key ${discoveredKey}: ${client ? 'found' : 'not found'}`)
         }
       }
+
+      // H2: session may have been re-created (restart/ready race) so the old
+      // sessionID lookup misses — fall back to the topic's current instance.
+      if (!client) {
+        const topicInstance = instanceManager.getInstanceByTopic(pending.topicId)
+        if (topicInstance) {
+          client = clients.get(topicInstance.config.instanceId)
+          console.log(
+            `[Integration] Permission fallback to topic ${pending.topicId} instance ${topicInstance.config.instanceId}: ${client ? 'found' : 'not found'} ` +
+            `(old session ${pending.permission.sessionID}, current ${topicInstance.sessionId ?? 'none'})`
+          )
+        }
+        if (!client) {
+          const discoveredKey = `discovered_${pending.topicId}`
+          client = clients.get(discoveredKey)
+          if (client) {
+            console.log(`[Integration] Permission fallback to discovered client ${discoveredKey}`)
+          }
+        }
+      }
       
       if (!client) {
-        console.error(`[Integration] No client found for session ${pending.permission.sessionID}`)
-        await ctx.answerCallbackQuery({ text: "Session not found" })
+        // H2: never leave a permission stall silent — tell the topic to resend
+        // and drop the dead pending entry (its reminder timer is cleared too).
+        console.error(`[Integration] No client found for session ${pending.permission.sessionID} (topic ${pending.topicId})`)
+        await ctx.answerCallbackQuery({ text: "Session not found — see topic for details", show_alert: true })
+        try {
+          await sendToTopic(
+            bot,
+            pending.chatId,
+            pending.topicId,
+            `⚠️ Permission request expired: the OpenCode session restarted and the pending approval can no longer be answered.\n\n` +
+            `Please resend your message.`
+          )
+        } catch (notifyError) {
+          console.error(`[Integration] Failed to send permission-expired notice:`, notifyError)
+        }
+        streamHandler.removePendingPermission(permissionId)
         return
       }
 

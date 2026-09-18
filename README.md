@@ -15,6 +15,8 @@ A Telegram bot that orchestrates multiple [OpenCode](https://opencode.ai) instan
 - **Instance Lifecycle Management**: Auto-start, health checks, crash recovery, idle timeout
 - **Persistent State**: SQLite databases track topic mappings and instance state across restarts
 - **Permission Handling**: Approve/deny dangerous operations via inline buttons
+- **Telegram-Aware Answers**: new sessions are told they are chatting through a Telegram forum topic, so replies stay short, use Telegram-safe formatting, and lead with the conclusion
+- **Connection Resilience**: dropped event streams reconnect automatically with bounded retries; if live updates can't be restored, the bot says so in chat instead of going silent
 
 ## Table of Contents
 
@@ -67,7 +69,19 @@ cd opencode-telegram
 # Install dependencies
 bun install
 
-# Configure environment
+# Configure environment (recommended: guided setup)
+bash scripts/setup-env.sh
+```
+
+The setup script walks through each setting (bot token, supergroup chat ID with
+optional auto-detect, opencode binary, instance/port settings, project
+directory, API port), validates your input, and writes `.env` with restricted
+permissions. Re-running it is safe: it backs up the existing `.env` first and
+keeps current values as defaults.
+
+Alternatively, configure manually:
+
+```bash
 cp .env.example .env
 # Edit .env with your bot token and chat ID
 ```
@@ -80,6 +94,46 @@ bun run dev
 
 # Production
 bun run start
+```
+
+## Install as a System Service (systemd)
+
+For a bot that survives logouts and restarts, install it as a systemd service:
+
+```bash
+# Preview what the installer will do (changes nothing)
+bash scripts/install.sh --dry-run
+
+# User service (default; runs as your user)
+bash scripts/install.sh
+
+# System-wide service (requires a target user; re-executes via sudo)
+bash scripts/install.sh --system --user <name>
+
+# Headless install from an existing env file
+bash scripts/install.sh --env-from /path/to/.env --non-interactive
+```
+
+The installer copies the app to a prefix (`~/.local/share/opencode-telegram` by
+default, `/opt/opencode-telegram` for `--system`, overridable with `--prefix`),
+runs `bun install`, writes the unit file, then enables and starts the service.
+Run `bash scripts/install.sh --help` for all flags. For `--system` installs,
+make sure `bun` is installed where the target `--user` can execute it,
+otherwise the service fails at first start.
+
+Check status, logs, and health:
+
+```bash
+systemctl --user is-active opencode-telegram.service
+journalctl --user -u opencode-telegram.service -f   # drop --user for --system installs
+curl -s http://localhost:4200/api/health            # 4200 unless API_PORT is set
+```
+
+To uninstall (keeps installed files unless `--yes` plus a typed `DELETE`
+confirmation):
+
+```bash
+bash scripts/install.sh --uninstall   # add --user <name> for --system installs
 ```
 
 ## Running with Docker

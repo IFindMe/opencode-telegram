@@ -155,9 +155,10 @@ export class OpenCodeClient {
     options?: {
       model?: { providerID: string; modelID: string }
       agent?: string
+      system?: string
     }
   ): Promise<void> {
-    const body: SendMessageRequest = {
+    const body: SendMessageRequest & { system?: string } = {
       parts: [{ type: "text", text }],
       ...options,
     }
@@ -316,7 +317,11 @@ export class OpenCodeClient {
   }
 
   /**
-   * Internal SSE connection handler
+   * Internal SSE connection handler with reconnect + backoff (H1 silent-stop fix).
+   * Retries transient drops (~5 attempts, exponential backoff) PER INCIDENT:
+   * the counter resets on every received event, so isolated blips over a long
+   * uptime never accumulate into a permanent deafness (F2). Calls onError
+   * ONCE only when unrecoverable so callers can notify Telegram (never silent).
    */
   private async startSSE(
     url: string,
@@ -324,69 +329,110 @@ export class OpenCodeClient {
     onError?: (error: Error) => void,
     signal?: AbortSignal
   ): Promise<void> {
-    try {
-      const response = await fetch(url, {
-        headers: {
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-        },
-        signal,
-      })
+    const maxRetries = 5
+    const baseDelayMs = 1000
+    const maxDelayMs = 15000
 
-      if (!response.ok) {
-        throw new OpenCodeClientError(
-          `SSE connection failed: ${response.status}`,
-          "SSE_ERROR",
-          response.status
-        )
-      }
+    // Consecutive-failure counter (per-incident budget, NOT lifetime).
+    let attempt = 0
+    while (true) {
+      try {
+        const response = await fetch(url, {
+          headers: {
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+          },
+          signal,
+        })
 
-      const reader = response.body?.getReader()
-      if (!reader) {
-        throw new OpenCodeClientError("No response body", "SSE_ERROR")
-      }
-
-      const decoder = new TextDecoder()
-      let buffer = ""
-
-      while (true) {
-        const { done, value } = await reader.read()
-        
-        if (done) {
-          break
+        if (!response.ok) {
+          throw new OpenCodeClientError(
+            `SSE connection failed: ${response.status}`,
+            "SSE_ERROR",
+            response.status
+          )
         }
 
-        buffer += decoder.decode(value, { stream: true })
-        
-        // Process complete events (separated by double newlines)
-        const events = buffer.split("\n\n")
-        buffer = events.pop() ?? "" // Keep incomplete event in buffer
+        const reader = response.body?.getReader()
+        if (!reader) {
+          throw new OpenCodeClientError("No response body", "SSE_ERROR")
+        }
 
-        for (const eventStr of events) {
-          if (!eventStr.trim()) continue
-          
-          const event = this.parseSSEEvent(eventStr)
-          if (event) {
-            onEvent(event)
+        // S1: successful connect proves liveness even before first event —
+        // reset per-incident budget so zero-event reconnects don't accumulate.
+        attempt = 0
+
+        const decoder = new TextDecoder()
+        let buffer = ""
+
+        while (true) {
+          if (signal?.aborted) {
+            try { reader.cancel() } catch { /* ignore */ }
+            return
+          }
+
+          const { done, value } = await reader.read()
+
+          if (done) {
+            // Server closed the stream mid-session — treat as a drop so we
+            // reconnect instead of going permanently silent (H1).
+            throw new OpenCodeClientError(
+              "SSE stream ended unexpectedly",
+              "SSE_ERROR"
+            )
+          }
+
+          buffer += decoder.decode(value, { stream: true })
+
+          // Process complete events (separated by double newlines)
+          const events = buffer.split("\n\n")
+          buffer = events.pop() ?? "" // Keep incomplete event in buffer
+
+          for (const eventStr of events) {
+            if (!eventStr.trim()) continue
+
+            const event = this.parseSSEEvent(eventStr)
+            if (event) {
+              onEvent(event)
+              // F2: the stream proved itself alive — reset the per-incident
+              // retry budget so lifetime blips never accumulate into deafness.
+              attempt = 0
+            }
           }
         }
+      } catch (error) {
+        if (signal?.aborted) {
+          // Normal abort, don't report as error
+          return
+        }
+
+        if (attempt >= maxRetries) {
+          const clientError = error instanceof OpenCodeClientError
+            ? error
+            : new OpenCodeClientError(
+                `SSE error: ${error instanceof Error ? error.message : String(error)}`,
+                "SSE_ERROR",
+                undefined,
+                error instanceof Error ? error : undefined
+              )
+
+          onError?.(clientError)
+          return
+        }
+
+        const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs)
+        const reason = error instanceof Error ? error.message : String(error)
+        console.warn(
+          `[OpenCodeClient] SSE connection lost (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms: ${reason}`
+        )
+        attempt++
+        await this.sleep(delay)
+
+        if (signal?.aborted) {
+          return
+        }
+        // Reconnect loop continues
       }
-    } catch (error) {
-      if (signal?.aborted) {
-        // Normal abort, don't report as error
-        return
-      }
-      
-      const clientError = error instanceof OpenCodeClientError
-        ? error
-        : new OpenCodeClientError(
-            `SSE error: ${error instanceof Error ? error.message : String(error)}`,
-            "SSE_ERROR",
-            undefined,
-            error instanceof Error ? error : undefined
-          )
-      
-      onError?.(clientError)
     }
   }
 

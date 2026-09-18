@@ -56,6 +56,9 @@ export {
 // Client
 export { OpenCodeClient, createClient } from "./client"
 
+// Telegram-context system prompt (injected once per bot-created session)
+export { buildTelegramSystemPrompt, TELEGRAM_SYSTEM_PROMPT_BASE } from "./telegram-system-prompt"
+
 // Stream Handler
 export { StreamHandler, createStreamHandler } from "./stream-handler"
 export type { PendingPermission, SessionIdleCallback } from "./stream-handler"

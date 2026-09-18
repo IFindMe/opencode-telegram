@@ -278,6 +278,19 @@ export class ApiServer {
         },
         (error) => {
           console.error(`[ApiServer] SSE error for ${projectName}:`, error)
+          // H1 parity: client already retried with backoff — notify the topic
+          // instead of staying silent.
+          const errMsg = error instanceof Error ? error.message : String(error)
+          void this.config.bot.api
+            .sendMessage(
+              chatId,
+              `⚠️ Lost live connection to OpenCode (${errMsg.slice(0, 120)}).\n\n` +
+                `Your last message may not complete. Check /status in General — a restart may be needed to restore live updates.`,
+              { message_thread_id: topicId }
+            )
+            .catch((notifyError) => {
+              console.error(`[ApiServer] Failed to send SSE-loss notice for ${projectName}:`, notifyError)
+            })
         }
       )
 

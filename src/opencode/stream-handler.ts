@@ -30,6 +30,10 @@ export interface PendingPermission {
   telegramMessageId?: number
   chatId: number
   topicId: number
+  /** Epoch ms when the permission card was posted (H2 reminder) */
+  createdAt: number
+  /** Whether the single stalled-permission reminder was already sent */
+  reminderSent?: boolean
 }
 
 /**
@@ -58,6 +62,9 @@ export class StreamHandler {
 
   /** Pending permission requests - keyed by permissionId */
   private readonly pendingPermissions: Map<string, PendingPermission> = new Map()
+
+  /** Reminder timers for pending permissions - keyed by permissionId (H2) */
+  private readonly permissionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
 
   /** Track message roles: messageId -> role */
   private readonly messageRoles: Map<string, "user" | "assistant"> = new Map()
@@ -108,6 +115,14 @@ export class StreamHandler {
     this.sessionToTelegram.delete(sessionId)
     this.sessionStreamingEnabled.delete(sessionId)
     this.states.delete(sessionId)
+    // H2/H5: drop pending permissions tied to a superseded session so stale
+    // 🔐 buttons can never block a new session silently.
+    for (const [permId, pending] of this.pendingPermissions) {
+      if (pending.permission.sessionID === sessionId) {
+        this.clearPermissionTimer(permId)
+        this.pendingPermissions.delete(permId)
+      }
+    }
   }
 
   /**
@@ -177,6 +192,7 @@ export class StreamHandler {
       props.sessionID ||                    // session.idle, session.status, session.diff
       props.info?.sessionID ||              // message.updated
       props.part?.sessionID ||              // message.part.updated
+      props.permission?.sessionID ||        // permission.updated (nested envelope variant, H2)
       (event.type === 'session.updated' ? props.info?.id : null) ||  // session.updated has id not sessionID
       null
     
@@ -497,13 +513,16 @@ export class StreamHandler {
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error)
+        // H4: always log lengths so over-length/parse failures are diagnosable.
+        const finalLen = finalContent.length
+        const rawLen = state.currentText.trim().length
         
         // Ignore "message is not modified" - content is already correct
         if (errorMsg.includes('message is not modified')) {
           // Already showing the right content, nothing to do
         } else if (state.telegramMessageId && errorMsg.includes('message to edit not found')) {
           // Original message was deleted, send as new message
-          console.log(`[StreamHandler] Original message deleted, sending final as new message`)
+          console.log(`[StreamHandler] Original message deleted, sending final as new message (finalLen=${finalLen} rawLen=${rawLen})`)
           try {
             await this.sendCallback(
               destination.chatId,
@@ -511,12 +530,13 @@ export class StreamHandler {
               finalContent,
               { parseMode: "HTML" }
             )
-          } catch {
-            // Give up
+          } catch (fallbackError) {
+            const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+            console.error(`[StreamHandler] Final fallback send failed (finalLen=${finalLen} rawLen=${rawLen}): ${fbMsg.slice(0, 120)}`)
           }
         } else if (errorMsg.includes("can't parse entities")) {
           // HTML parsing failed, try sending as plain text
-          console.log(`[StreamHandler] HTML parsing failed, falling back to plain text`)
+          console.log(`[StreamHandler] HTML parsing failed, falling back to plain text (finalLen=${finalLen} rawLen=${rawLen})`)
           try {
             await this.sendCallback(
               destination.chatId,
@@ -524,8 +544,20 @@ export class StreamHandler {
               state.currentText.trim(),
               { editMessageId: state.telegramMessageId }
             )
-          } catch {
-            // Give up
+          } catch (plainError) {
+            const plMsg = plainError instanceof Error ? plainError.message : String(plainError)
+            console.error(`[StreamHandler] Plain-text final edit failed (rawLen=${rawLen}): ${plMsg.slice(0, 120)}, sending as new message`)
+            try {
+              await this.sendCallback(
+                destination.chatId,
+                destination.topicId,
+                state.currentText.trim(),
+                {}
+              )
+            } catch (plainFallbackError) {
+              const pfbMsg = plainFallbackError instanceof Error ? plainFallbackError.message : String(plainFallbackError)
+              console.error(`[StreamHandler] Plain-text fallback send failed (rawLen=${rawLen}): ${pfbMsg.slice(0, 120)}`)
+            }
           }
         } else if (errorMsg.includes('429') || errorMsg.includes('Too Many Requests') || errorMsg.includes('Rate limited')) {
           // Rate limited - wait and retry the final response (it's important!)
@@ -559,7 +591,8 @@ export class StreamHandler {
             }
           } catch (retryError) {
             // If retry also fails, try sending as a new message
-            console.log(`[StreamHandler] Retry failed, sending final response as new message`)
+            const rtMsg = retryError instanceof Error ? retryError.message : String(retryError)
+            console.log(`[StreamHandler] Retry failed (${rtMsg.slice(0, 80)}), sending final response as new message (finalLen=${finalLen} rawLen=${rawLen})`)
             try {
               await this.sendCallback(
                 destination.chatId,
@@ -567,13 +600,26 @@ export class StreamHandler {
                 finalContent,
                 { parseMode: "HTML" }
               )
-            } catch {
-              console.error(`[StreamHandler] Failed to send final response even after retry`)
+            } catch (finalRetryError) {
+              const frMsg = finalRetryError instanceof Error ? finalRetryError.message : String(finalRetryError)
+              console.error(`[StreamHandler] Failed to send final response even after retry (finalLen=${finalLen} rawLen=${rawLen}): ${frMsg.slice(0, 120)}`)
             }
           }
         } else {
-          // For other errors, just log - the progress message already has content
-          console.log(`[StreamHandler] Final edit failed (${errorMsg.slice(0, 80)}), keeping progress message`)
+          // H4: ANY other final-edit failure must still surface the answer as a
+          // new message — never leave a frozen progress message as silence.
+          console.log(`[StreamHandler] Final edit failed (${errorMsg.slice(0, 80)} finalLen=${finalLen} rawLen=${rawLen}), sending as new message`)
+          try {
+            await this.sendCallback(
+              destination.chatId,
+              destination.topicId,
+              finalContent,
+              { parseMode: "HTML" }
+            )
+          } catch (fallbackError) {
+            const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+            console.error(`[StreamHandler] Final fallback send failed (finalLen=${finalLen} rawLen=${rawLen}): ${fbMsg.slice(0, 120)}`)
+          }
         }
       }
     } else if (this.config.deleteProgressOnComplete && state.telegramMessageId && this.deleteCallback) {
@@ -685,13 +731,42 @@ export class StreamHandler {
   }
 
   /**
-   * Handle permission request from OpenCode
+   * Handle permission request from OpenCode (H2: envelope validation + reminder)
    */
   private async handlePermissionUpdated(
     event: SSEEvent,
     destination: { chatId: number; topicId: number }
   ): Promise<void> {
-    const permission = event.properties as Permission
+    // Defensively unwrap: live envelope may nest the permission object.
+    const raw = event.properties as Record<string, any>
+    const candidate = (raw?.permission ?? raw) as Partial<Permission> & Record<string, any>
+    const permission = candidate as Permission
+
+    if (!permission || typeof permission.id !== "string" || !permission.id) {
+      console.error(
+        `[StreamHandler] permission.updated with missing/invalid id, raw shape: ${JSON.stringify(raw).slice(0, 500)}`
+      )
+      // F3: never leave the session blocked silently on an unknown envelope —
+      // best-effort fallback notice (the H2 reminder path can't run without an id).
+      try {
+        await this.sendCallback(destination.chatId, destination.topicId,
+          `⚠️ <b>OpenCode needs permission</b> but the request couldn't be displayed. Please resend your last message.`,
+          { parseMode: "HTML" })
+      } catch { /* best-effort notice */ }
+      return
+    }
+    if (!permission.sessionID) {
+      console.error(
+        `[StreamHandler] permission.updated ${permission.id} missing sessionID, raw shape: ${JSON.stringify(raw).slice(0, 500)}`
+      )
+      // F3: same fallback — session is blocked until answered, so stay loud.
+      try {
+        await this.sendCallback(destination.chatId, destination.topicId,
+          `⚠️ <b>OpenCode needs permission</b> but the request couldn't be displayed. Please resend your last message.`,
+          { parseMode: "HTML" })
+      } catch { /* best-effort notice */ }
+      return
+    }
 
     console.log(`[StreamHandler] Permission request: ${permission.type} - ${permission.title}`)
 
@@ -720,15 +795,60 @@ export class StreamHandler {
         }
       )
 
-      // Store pending permission for later resolution
+      // Store pending permission for later resolution + schedule one reminder (H2)
+      this.clearPermissionTimer(permission.id)
       this.pendingPermissions.set(permission.id, {
         permission,
         telegramMessageId: result.messageId,
         chatId: destination.chatId,
         topicId: destination.topicId,
+        createdAt: Date.now(),
+        reminderSent: false,
       })
+      this.schedulePermissionReminder(permission.id)
     } catch (error) {
       console.error(`[StreamHandler] Failed to send permission prompt:`, error)
+    }
+  }
+
+  /**
+   * H2: single reminder if a permission sits unanswered (session is blocked
+   * until answered, so silence here looks exactly like silent-stop).
+   * No auto-deny here — StreamHandler has no OpenCode client; the resolve
+   * path in integration.ts notifies loudly instead. Timer is stdlib only.
+   */
+  private schedulePermissionReminder(permissionId: string): void {
+    const REMINDER_AFTER_MS = 5 * 60 * 1000 // 5 min
+    const timer = setTimeout(async () => {
+      const pending = this.pendingPermissions.get(permissionId)
+      if (!pending || pending.reminderSent) return
+      pending.reminderSent = true
+      console.log(`[StreamHandler] Permission ${permissionId} still pending after 5min, sending reminder`)
+      try {
+        await this.sendCallback(
+          pending.chatId,
+          pending.topicId,
+          `⏳ <b>Still waiting for permission:</b> ${this.escapeHtml(pending.permission.title)}\n` +
+          `<i>Tap Allow/Deny above — the session is paused until you answer.</i>`,
+          { parseMode: "HTML" }
+        )
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        console.error(`[StreamHandler] Permission reminder send failed (${permissionId}): ${msg.slice(0, 120)}`)
+      }
+    }, REMINDER_AFTER_MS)
+    // Don't keep the process alive just for a reminder.
+    if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+      (timer as unknown as { unref: () => void }).unref()
+    }
+    this.permissionTimers.set(permissionId, timer)
+  }
+
+  private clearPermissionTimer(permissionId: string): void {
+    const timer = this.permissionTimers.get(permissionId)
+    if (timer) {
+      clearTimeout(timer)
+      this.permissionTimers.delete(permissionId)
     }
   }
 
@@ -765,6 +885,7 @@ export class StreamHandler {
           // Ignore edit errors
         }
       }
+      this.clearPermissionTimer(props.permissionID)
       this.pendingPermissions.delete(props.permissionID)
     }
   }
@@ -820,6 +941,7 @@ export class StreamHandler {
    * Remove a pending permission (after it's been handled)
    */
   removePendingPermission(permissionId: string): void {
+    this.clearPermissionTimer(permissionId)
     this.pendingPermissions.delete(permissionId)
   }
 
@@ -1130,6 +1252,10 @@ export class StreamHandler {
    * Clear all state (for shutdown)
    */
   clear(): void {
+    for (const timer of this.permissionTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.permissionTimers.clear()
     this.states.clear()
     this.sessionToTelegram.clear()
     this.sessionStreamingEnabled.clear()
