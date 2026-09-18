@@ -216,10 +216,11 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
   }
 
   // Create stream handler
-  // Note: updateIntervalMs set to 2000ms to stay well within Telegram's rate limits
+  // Note: updateIntervalMs defaults to 1000ms (~1 edit/sec per message, within
+  // Telegram's per-message edit budget); override via STREAM_UPDATE_INTERVAL_MS (500-5000)
   // Telegram allows ~30 messages/second to a group, but edits to same message are more restricted
   const streamHandler = new StreamHandler(sendCallback, deleteCallback, {
-    updateIntervalMs: 2000,
+    updateIntervalMs: config.opencode.streamUpdateIntervalMs,
     showToolNames: true,
     deleteProgressOnComplete: true,
   })

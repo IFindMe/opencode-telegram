@@ -461,7 +461,7 @@ export type TelegramDeleteCallback = (
  * Configuration for StreamHandler
  */
 export interface StreamHandlerConfig {
-  /** Minimum interval between Telegram updates in ms (default: 500) */
+  /** Minimum interval between Telegram updates in ms (default: 1000) */
   updateIntervalMs: number
   
   /** Maximum text length before truncating in progress messages */
@@ -476,11 +476,11 @@ export interface StreamHandlerConfig {
 
 /**
  * Default stream handler configuration
- * Note: updateIntervalMs defaults to 2000ms to stay within Telegram rate limits
+ * Note: updateIntervalMs defaults to 1000ms to stay within Telegram rate limits
  * Telegram rate limits edits more aggressively than new messages
  */
 export const DEFAULT_STREAM_HANDLER_CONFIG: StreamHandlerConfig = {
-  updateIntervalMs: 2000,
+  updateIntervalMs: 1000,
   maxProgressTextLength: 200,
   showToolNames: true,
   deleteProgressOnComplete: true,

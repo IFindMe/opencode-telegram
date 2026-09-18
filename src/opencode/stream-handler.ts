@@ -66,6 +66,12 @@ export class StreamHandler {
   /** Reminder timers for pending permissions - keyed by permissionId (H2) */
   private readonly permissionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
 
+  /** One-shot trailing-flush timers - keyed by sessionId (at most one per session) */
+  private readonly flushTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+
+  /** Last successfully rendered progress text - keyed by sessionId (dirty check) */
+  private readonly lastRenderedText: Map<string, string> = new Map()
+
   /** Track message roles: messageId -> role */
   private readonly messageRoles: Map<string, "user" | "assistant"> = new Map()
 
@@ -112,6 +118,8 @@ export class StreamHandler {
    * Unregister a session
    */
   unregisterSession(sessionId: string): void {
+    this.clearFlushTimer(sessionId)
+    this.lastRenderedText.delete(sessionId)
     this.sessionToTelegram.delete(sessionId)
     this.sessionStreamingEnabled.delete(sessionId)
     this.states.delete(sessionId)
@@ -484,6 +492,8 @@ export class StreamHandler {
 
     state.isProcessing = false
 
+    // A pending trailing flush is superseded by the final render below.
+    this.clearFlushTimer(sessionId)
     // Send final response - edit the progress message if we have one
     if (state.currentText.trim()) {
       // Convert Markdown to Telegram HTML for proper rendering
@@ -633,6 +643,7 @@ export class StreamHandler {
 
     // Clean up state
     this.states.delete(sessionId)
+    this.lastRenderedText.delete(sessionId)
     
     // Clean up message roles and sent user messages (keep maps from growing indefinitely)
     // We can't easily filter by session, so just clear old entries periodically
@@ -967,13 +978,72 @@ export class StreamHandler {
     const now = Date.now()
     const lastUpdate = state.lastTelegramUpdateAt?.getTime() ?? 0
     
-    // Use longer interval for streaming mode to avoid rate limits
-    // Telegram is strict about message edits - max ~20/minute
-    const streamingEnabled = this.isStreamingEnabled(sessionId)
-    const updateInterval = streamingEnabled ? 3000 : this.config.updateIntervalMs  // 3s for streaming
+    // Telegram is strict about message edits (~1/sec per message is safe);
+    // both streaming and non-streaming paths share the same 1s floor.
+    // The `streamingEnabled` branch lives in effectiveUpdateIntervalMs so a
+    // future split is easy.
+    const updateInterval = this.effectiveUpdateIntervalMs(sessionId)
     
     if (now - lastUpdate >= updateInterval) {
       await this.updateTelegram(sessionId, state, destination, false)
+    } else {
+      // Throttled: schedule a one-shot trailing flush so a paused tail still
+      // renders promptly without extra edits during bursts.
+      this.scheduleTrailingFlush(sessionId, state, destination, updateInterval)
+    }
+  }
+
+  /**
+   * Effective minimum interval between Telegram edits for a session.
+   * Both paths resolve to the same 1s floor today (streaming and non-streaming
+   * unified); the `streamingEnabled` branch is kept so a future split is easy.
+   */
+  private effectiveUpdateIntervalMs(sessionId: string): number {
+    return this.isStreamingEnabled(sessionId) ? 1000 : this.config.updateIntervalMs
+  }
+
+  /**
+   * Schedule a one-shot trailing flush ~1 interval later that renders the
+   * latest state only if still dirty and the session is still active.
+   * Never stacks: at most one pending timer per session (replaced on newer
+   * events). Stdlib setTimeout only — no new dependencies.
+   */
+  private scheduleTrailingFlush(
+    sessionId: string,
+    state: StreamingState,
+    destination: { chatId: number; topicId: number },
+    delayMs: number
+  ): void {
+    this.clearFlushTimer(sessionId)
+    const timer = setTimeout(() => {
+      this.flushTimers.delete(sessionId)
+      // Session still active? (unregistered / idle-rendered / cleared → skip)
+      const dest = this.sessionToTelegram.get(sessionId) ?? destination
+      if (!this.sessionToTelegram.has(sessionId)) return
+      const current = this.states.get(sessionId)
+      if (!current || current !== state) return
+      // Re-check the throttle window: an intermediate render already showed
+      // everything this timer knew about, so there is nothing unrendered.
+      const lastUpdate = current.lastTelegramUpdateAt?.getTime() ?? 0
+      if (Date.now() - lastUpdate < this.effectiveUpdateIntervalMs(sessionId)) return
+      // updateTelegram re-checks dirty state; all error handling lives there.
+      void this.updateTelegram(sessionId, current, dest, false)
+    }, delayMs)
+    // Don't keep the process alive just for a flush.
+    if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+      (timer as unknown as { unref: () => void }).unref()
+    }
+    this.flushTimers.set(sessionId, timer)
+  }
+
+  /**
+   * Cancel any pending trailing flush for a session (idempotent).
+   */
+  private clearFlushTimer(sessionId: string): void {
+    const timer = this.flushTimers.get(sessionId)
+    if (timer) {
+      clearTimeout(timer)
+      this.flushTimers.delete(sessionId)
     }
   }
 
@@ -992,6 +1062,12 @@ export class StreamHandler {
     }
     
     const progressText = this.formatProgressMessage(state, sessionId)
+    // Dirty check: skip the edit when the formatted text is unchanged since
+    // the last successful render — avoids useless edits burning rate budget.
+    // (Backstop: the "message is not modified" catch below.)
+    if (state.telegramMessageId && progressText === this.lastRenderedText.get(sessionId)) {
+      return
+    }
     
     try {
       if (state.telegramMessageId) {
@@ -1023,12 +1099,14 @@ export class StreamHandler {
       }
       
       state.lastTelegramUpdateAt = new Date()
+      this.lastRenderedText.set(sessionId, progressText)
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       
       // Ignore "message is not modified" errors - this just means content is the same
       if (errorMsg.includes('message is not modified')) {
         state.lastTelegramUpdateAt = new Date()
+        this.lastRenderedText.set(sessionId, progressText)
         return
       }
       
@@ -1054,6 +1132,7 @@ export class StreamHandler {
           )
           state.telegramMessageId = result.messageId
           state.lastTelegramUpdateAt = new Date()
+          this.lastRenderedText.set(sessionId, progressText)
         } catch {
           // Give up on this update
         }
@@ -1256,6 +1335,11 @@ export class StreamHandler {
       clearTimeout(timer)
     }
     this.permissionTimers.clear()
+    for (const timer of this.flushTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.flushTimers.clear()
+    this.lastRenderedText.clear()
     this.states.clear()
     this.sessionToTelegram.clear()
     this.sessionStreamingEnabled.clear()

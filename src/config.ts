@@ -58,6 +58,9 @@ export interface OpenCodeConfig {
   
   /** Stale topic cleanup interval in milliseconds */
   staleTopicCleanupIntervalMs: number
+
+  /** Minimum interval between Telegram progress edits in ms (default: 1000, clamped 500-5000 via STREAM_UPDATE_INTERVAL_MS) */
+  streamUpdateIntervalMs: number
 }
 
 /**
@@ -113,6 +116,7 @@ const DEFAULT_CONFIG: AppConfig = {
     startupTimeoutMs: 60_000,
     staleTopicTimeoutMs: 60 * 60 * 1000, // 1 hour
     staleTopicCleanupIntervalMs: 5 * 60 * 1000, // 5 minutes
+    streamUpdateIntervalMs: 1000, // 1s Telegram progress-edit floor (override: STREAM_UPDATE_INTERVAL_MS)
   },
   storage: {
     orchestratorDbPath: "./data/orchestrator.db",
@@ -149,6 +153,7 @@ export function loadConfig(): AppConfig {
       startupTimeoutMs: parseIntEnv("OPENCODE_STARTUP_TIMEOUT_MS", DEFAULT_CONFIG.opencode.startupTimeoutMs),
       staleTopicTimeoutMs: parseIntEnv("STALE_TOPIC_TIMEOUT_MS", DEFAULT_CONFIG.opencode.staleTopicTimeoutMs),
       staleTopicCleanupIntervalMs: parseIntEnv("STALE_TOPIC_CLEANUP_INTERVAL_MS", DEFAULT_CONFIG.opencode.staleTopicCleanupIntervalMs),
+      streamUpdateIntervalMs: Math.min(5000, Math.max(500, parseIntEnv("STREAM_UPDATE_INTERVAL_MS", DEFAULT_CONFIG.opencode.streamUpdateIntervalMs))),
     },
     storage: {
       orchestratorDbPath: getEnv("ORCHESTRATOR_DB_PATH", DEFAULT_CONFIG.storage.orchestratorDbPath),
