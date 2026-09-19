@@ -21,7 +21,6 @@ import {
   type ActiveSessionInfo,
   type ConnectResult,
   type DisconnectResult,
-  type StaleSessionInfo,
   type CreateTopicResult,
   type ManagedProjectInfo,
 } from "./bot/handlers/forum"
@@ -39,6 +38,8 @@ import {
 } from "./opencode"
 import type { IOpenCodeClient, ResponseHandler, ForumMessageContext, MessageRouteResult } from "./types/forum"
 import { ApiServer, createApiServer } from "./api-server"
+import { TelegramSendQueue } from "./telegram/send-queue"
+import { BOT_LOCKFILE_PATH, isTelegramConflictError } from "./bot-guard"
 
 // =============================================================================
 // Types
@@ -115,90 +116,63 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
   // found-existing, discovered, TUI, or external sessions.
   const systemPromptPending = new Set<string>()
 
-  // Rate limit state for Telegram API
-  let rateLimitedUntil = 0
-
-  // Stale topic cleanup timer
-  let staleCleanupTimer: ReturnType<typeof setInterval> | null = null
-
-  // Create Telegram send callback for stream handler with rate limit handling
-  const sendCallback: TelegramSendCallback = async (chatId, topicId, text, options) => {
-    // Check if we're currently rate limited
-    const now = Date.now()
-    if (now < rateLimitedUntil) {
-      const waitTime = rateLimitedUntil - now
-      // For edits, just throw immediately - stream handler will skip
-      if (options?.editMessageId) {
-        throw new Error(`Rate limited for ${waitTime}ms`)
-      }
-      console.log(`[Integration] Rate limited, waiting ${waitTime}ms`)
-      await new Promise(resolve => setTimeout(resolve, waitTime))
-    }
-
-    // Build reply markup if inline keyboard is provided
-    const reply_markup = options?.inlineKeyboard
-      ? { inline_keyboard: options.inlineKeyboard }
-      : undefined
-
-    try {
-      if (options?.editMessageId) {
-        // Edit existing message - no retries, just fail fast
-        await bot.api.editMessageText(chatId, options.editMessageId, text, {
-          parse_mode: options.parseMode,
+  // Shared Telegram send queue (task 03): bot-wide pacing (~25 msg/s, under
+  // Telegram's ~30/s group budget) + the per-message edit floor, shared 429
+  // backoff (honor retry-after +500ms), priority finals/cards/notices over
+  // progress edits. Single construction site — ALL sends/edits go through it.
+  const sendQueue = new TelegramSendQueue({
+    sender: async (item) => {
+      const reply_markup = item.inlineKeyboard
+        ? { inline_keyboard: item.inlineKeyboard }
+        : undefined
+      if (item.editMessageId !== undefined) {
+        await bot.api.editMessageText(item.chatId, item.editMessageId, item.text, {
+          parse_mode: item.parseMode,
           reply_markup,
         })
-        return { messageId: options.editMessageId }
-      } else {
-        // Send new message - retry on rate limit
-        const maxRetries = 3
-        let lastError: Error | undefined
-        
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-          try {
-            const result = await bot.api.sendMessage(chatId, text, {
-              message_thread_id: topicId || undefined,
-              parse_mode: options?.parseMode,
-              reply_to_message_id: options?.replyToMessageId,
-              reply_markup,
-            })
-            return { messageId: result.message_id }
-          } catch (error) {
-            lastError = error instanceof Error ? error : new Error(String(error))
-            
-            // Check for rate limit (429)
-            if (lastError.message.includes('429') || lastError.message.includes('Too Many Requests')) {
-              const retryMatch = lastError.message.match(/retry after (\d+)/i)
-              const retryAfter = retryMatch ? parseInt(retryMatch[1], 10) : 3
-              
-              rateLimitedUntil = Date.now() + (retryAfter * 1000) + 500
-              console.log(`[Integration] Rate limited on send, will retry after ${retryAfter}s (attempt ${attempt + 1}/${maxRetries})`)
-              
-              if (attempt < maxRetries - 1) {
-                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000 + 500))
-                continue
-              }
-            }
-            
-            // For non-rate-limit errors, don't retry
-            throw lastError
-          }
-        }
-        
-        throw lastError
+        return { messageId: item.editMessageId }
       }
+      const result = await bot.api.sendMessage(item.chatId, item.text, {
+        message_thread_id: item.topicId || undefined,
+        parse_mode: item.parseMode,
+        reply_to_message_id: item.replyToMessageId,
+        reply_markup,
+      })
+      return { messageId: result.message_id }
+    },
+    sendIntervalMs: config.opencode.sendIntervalMs,
+    editFloorMs: config.opencode.streamUpdateIntervalMs,
+  })
+
+  // Create Telegram send callback for stream handler: routes ALL sends/edits
+  // through the shared queue. Priority defaults to "final" (never dropped —
+  // finals, cards, notices queue + retry); only the progress-render path
+  // passes queuePriority "progress" (skippable when saturated).
+  const sendCallback: TelegramSendCallback = async (chatId, topicId, text, options) => {
+    try {
+      return await sendQueue.submit({
+        chatId,
+        topicId,
+        text,
+        editMessageId: options?.editMessageId,
+        parseMode: options?.parseMode,
+        replyToMessageId: options?.replyToMessageId,
+        inlineKeyboard: options?.inlineKeyboard,
+        priority: options?.queuePriority ?? "final",
+      })
     } catch (error) {
       const lastError = error instanceof Error ? error : new Error(String(error))
       
       // "message is not modified" is not a real error - return success
+      // (backstop; the queue already resolves this as success)
       if (lastError.message.includes('message is not modified')) {
         return { messageId: options?.editMessageId ?? 0 }
       }
       
-      // Update rate limit state for 429 errors
+      // 429 after the queue's shared backoff + retries: log and surface so
+      // the StreamHandler final-retry/fallback paths compose on top (bounded).
       if (lastError.message.includes('429') || lastError.message.includes('Too Many Requests')) {
-        const retryMatch = lastError.message.match(/retry after (\d+)/i)
-        const retryAfter = retryMatch ? parseInt(retryMatch[1], 10) : 3
-        rateLimitedUntil = Date.now() + (retryAfter * 1000) + 500
+        console.log(`[Integration] Send queue exhausted retries (429), surfacing to caller`)
       }
       
       throw lastError
@@ -1280,105 +1254,6 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     }
   }
 
-  // Auto-cleanup stale topics based on timeout
-  async function runStaleTopicCleanup(): Promise<void> {
-    const chatId = config.telegram.chatId
-    if (!chatId) return
-
-    console.log(`[Integration] Running stale topic cleanup (timeout: ${config.opencode.staleTopicTimeoutMs / 1000 / 60} minutes)`)
-
-    try {
-      // Find stale topics using the topic store's built-in method
-      const staleMappings = topicStore.findStaleSessions(config.opencode.staleTopicTimeoutMs)
-
-      if (staleMappings.length === 0) {
-        console.log(`[Integration] No stale topics found`)
-        return
-      }
-
-      console.log(`[Integration] Found ${staleMappings.length} stale topic(s) to clean up`)
-
-      const cleanedTopics: string[] = []
-      const failedTopics: string[] = []
-
-      for (const mapping of staleMappings) {
-        try {
-          // Clean up SSE subscription if exists
-          const discoveredKey = `discovered_${mapping.topicId}`
-          const abort = sseSubscriptions.get(discoveredKey)
-          if (abort) {
-            abort()
-            sseSubscriptions.delete(discoveredKey)
-          }
-
-          const client = clients.get(discoveredKey)
-          if (client) {
-            client.close()
-            clients.delete(discoveredKey)
-          }
-
-          // Unregister from stream handler
-          streamHandler.unregisterSession(mapping.sessionId)
-
-          // Stop managed instance if exists
-          const managedInstance = instanceManager.getInstanceByTopic(mapping.topicId)
-          if (managedInstance) {
-            await instanceManager.stopInstance(managedInstance.config.instanceId)
-          }
-
-          // Delete the topic mapping
-          topicStore.deleteMapping(chatId, mapping.topicId)
-
-          // Try to delete the Telegram topic
-          try {
-            await bot.api.deleteForumTopic(chatId, mapping.topicId)
-            console.log(`[Integration] Deleted stale topic ${mapping.topicId} (${mapping.topicName})`)
-          } catch (error) {
-            // Topic deletion might fail if it's already deleted
-            console.warn(`[Integration] Could not delete Telegram topic ${mapping.topicId}:`, error)
-          }
-
-          cleanedTopics.push(mapping.topicName)
-        } catch (error) {
-          console.error(`[Integration] Failed to clean up topic ${mapping.topicId}:`, error)
-          failedTopics.push(mapping.topicName)
-        }
-      }
-
-      // Send summary to General topic (topicId = 0 means General)
-      if (cleanedTopics.length > 0 || failedTopics.length > 0) {
-        let message = `*Stale Topic Cleanup*\n\n`
-        
-        if (cleanedTopics.length > 0) {
-          message += `*Cleaned up ${cleanedTopics.length} topic(s):*\n`
-          for (const name of cleanedTopics) {
-            message += `  - ${name}\n`
-          }
-        }
-        
-        if (failedTopics.length > 0) {
-          message += `\n*Failed to clean up ${failedTopics.length} topic(s):*\n`
-          for (const name of failedTopics) {
-            message += `  - ${name}\n`
-          }
-        }
-
-        message += `\n_Topics inactive for ${config.opencode.staleTopicTimeoutMs / 1000 / 60} minutes are automatically cleaned up._`
-
-        try {
-          await bot.api.sendMessage(chatId, message, {
-            parse_mode: "Markdown",
-            // General topic has no message_thread_id
-          })
-        } catch (error) {
-          console.error(`[Integration] Failed to send cleanup summary to General topic:`, error)
-        }
-      }
-    } catch (error) {
-      console.error(`[Integration] Error during stale topic cleanup:`, error)
-    }
-  }
-
   // Helper to disconnect a session and delete its topic
   async function disconnectSession(chatId: number, topicId: number): Promise<{
     success: boolean
@@ -1606,6 +1481,77 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     return projects
   }
 
+  // Task 02: abort the in-flight turn for a topic (/cancel + ⏹ button).
+  // Resolves the client via the SAME lookup chain as the permission branch
+  // below (managed sessionToInstance → clients, then discovered_<topicId>
+  // fallback, then topic-instance fallback). Never unregisters the session —
+  // it stays usable for the next message. Posts exactly one outcome message
+  // via sendToTopic; callers (forum.ts) add no extra reply.
+  async function handleCancelRequest(chatId: number, topicId: number): Promise<{ ok: boolean; message: string }> {
+    const mapping = topicStore.getMapping(chatId, topicId)
+    let sessionId = mapping?.sessionId
+
+    // Resolve the client (same chain as the perm: branch)
+    let client: OpenCodeClient | undefined
+    if (sessionId && !sessionId.startsWith("pending_")) {
+      const instanceId = sessionToInstance.get(sessionId)
+      if (instanceId) {
+        client = clients.get(instanceId)
+      }
+      if (!client) {
+        const destination = streamHandler.getTelegramDestination(sessionId)
+        if (destination) {
+          client = clients.get(`discovered_${destination.topicId}`)
+        }
+      }
+    }
+    // Fall back to the topic's current instance (a restart/ready race may
+    // have superseded the mapped sessionId).
+    if (!client) {
+      const topicInstance = instanceManager.getInstanceByTopic(topicId)
+      if (topicInstance) {
+        client = clients.get(topicInstance.config.instanceId)
+        if (topicInstance.sessionId) {
+          sessionId = topicInstance.sessionId
+        }
+      }
+      if (!client) {
+        client = clients.get(`discovered_${topicId}`)
+      }
+    }
+
+    if (!client || !sessionId || sessionId.startsWith("pending_")) {
+      const message = "Nothing to cancel — no active session in this topic."
+      await sendToTopic(bot, chatId, topicId, message)
+      return { ok: false, message }
+    }
+
+    // No-op with a polite notice when nothing is in-flight.
+    if (!streamHandler.isProcessing(sessionId)) {
+      const message = "Nothing in-flight — the session is idle. Send a message to start a turn."
+      await sendToTopic(bot, chatId, topicId, message)
+      return { ok: false, message }
+    }
+
+    try {
+      await client.abortSession(sessionId)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      console.error(`[Integration] Cancel failed for session ${sessionId} (topic ${topicId}): ${reason.slice(0, 120)}`)
+      // Abort failures (e.g. the turn already finished) still end the turn
+      // locally so state never sticks — the session stays usable.
+      streamHandler.markAborted(sessionId)
+      const message = `Cancel failed (${reason.slice(0, 80)}) — session still active, try again or send a new message.`
+      await sendToTopic(bot, chatId, topicId, message)
+      return { ok: false, message }
+    }
+
+    streamHandler.markAborted(sessionId)
+    const message = "⏹ Cancelled — session still active, send a new message."
+    await sendToTopic(bot, chatId, topicId, message)
+    return { ok: true, message }
+  }
+
   // Register forum commands FIRST (before text handlers so /commands are processed)
   bot.use(createForumCommands({ 
     topicManager, 
@@ -1642,7 +1588,8 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           }
         }
       }
-    }
+    },
+    onCancelRequest: handleCancelRequest,
   }))
 
   // Register forum handlers
@@ -1837,32 +1784,27 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       // Recover orchestrator state
       await instanceManager.recover()
 
-      // Start stale topic cleanup timer
-      if (config.opencode.staleTopicCleanupIntervalMs > 0) {
-        console.log(`[Integration] Starting stale topic cleanup timer (interval: ${config.opencode.staleTopicCleanupIntervalMs / 1000 / 60} minutes)`)
-        staleCleanupTimer = setInterval(
-          () => runStaleTopicCleanup(),
-          config.opencode.staleTopicCleanupIntervalMs
-        )
+      // Start bot (409 here means another poller is polling right now)
+      try {
+        await bot.start({
+          allowed_updates: ["message", "edited_message", "callback_query"],
+          onStart: (info) => {
+            console.log(`[Integration] Bot started as @${info.username}`)
+          },
+        })
+      } catch (error) {
+        if (isTelegramConflictError(error)) {
+          console.error(
+            `[Integration] Telegram 409 getUpdates conflict — another poller is polling this token. ` +
+            `Kill the other instance (see lock: ${BOT_LOCKFILE_PATH}) and restart.`
+          )
+        }
+        throw error
       }
-
-      // Start bot
-      await bot.start({
-        allowed_updates: ["message", "edited_message", "callback_query"],
-        onStart: (info) => {
-          console.log(`[Integration] Bot started as @${info.username}`)
-        },
-      })
     },
 
     async stop() {
       console.log("[Integration] Stopping application...")
-
-      // Stop stale topic cleanup timer
-      if (staleCleanupTimer) {
-        clearInterval(staleCleanupTimer)
-        staleCleanupTimer = null
-      }
 
       // Stop API server
       apiServer.stop()

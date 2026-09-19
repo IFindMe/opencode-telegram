@@ -566,24 +566,6 @@ export class TopicStore {
   }
 
   /**
-   * Find stale sessions (no activity within timeout)
-   */
-  findStaleSessions(timeoutMs: number): TopicMapping[] {
-    const cutoff = Date.now() - timeoutMs
-
-    const stmt = this.db.prepare(`
-      SELECT tm.* FROM topic_mappings tm
-      LEFT JOIN topic_stats ts ON tm.chat_id = ts.chat_id AND tm.topic_id = ts.topic_id
-      WHERE tm.status = 'active'
-        AND (ts.last_message_at IS NULL OR ts.last_message_at < ?)
-        AND tm.updated_at < ?
-    `)
-
-    const rows = stmt.all(cutoff, cutoff) as Record<string, unknown>[]
-    return rows.map(row => this.rowToMapping(row))
-  }
-
-  /**
    * Convert database row to TopicMapping
    */
   private rowToMapping(row: Record<string, unknown>): TopicMapping {

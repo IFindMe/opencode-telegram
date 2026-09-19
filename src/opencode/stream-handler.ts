@@ -1120,6 +1120,11 @@ export class StreamHandler {
     }
     
     const progressText = this.formatProgressMessage(state, sessionId)
+    // Task 02: in-flight progress carries a ⏹ Cancel button
+    // (callback_data follows the namespaced `perm:<...>` convention).
+    const cancelKeyboard: InlineKeyboardButton[][] = [
+      [{ text: "⏹ Cancel", callback_data: `cancel:${sessionId}` }],
+    ]
     // Dirty check: skip the edit when the formatted text is unchanged since
     // the last successful render — avoids useless edits burning rate budget.
     // (Backstop: the "message is not modified" catch below.)
@@ -1129,7 +1134,8 @@ export class StreamHandler {
     
     try {
       if (state.telegramMessageId) {
-        // Edit existing message
+        // Edit existing message (progress class: skippable when saturated;
+        // finals/cards/notices default to the never-drop class)
         await this.sendCallback(
           destination.chatId,
           destination.topicId,
@@ -1137,6 +1143,7 @@ export class StreamHandler {
           {
             parseMode: "HTML",
             editMessageId: state.telegramMessageId,
+            queuePriority: "progress",
           }
         )
       } else {
@@ -1148,7 +1155,7 @@ export class StreamHandler {
             destination.chatId,
             destination.topicId,
             progressText,
-            { parseMode: "HTML" }
+            { parseMode: "HTML", queuePriority: "progress" }
           )
           state.telegramMessageId = result.messageId
         } finally {
@@ -1186,7 +1193,7 @@ export class StreamHandler {
             destination.chatId,
             destination.topicId,
             progressText,
-            { parseMode: "HTML" }
+            { parseMode: "HTML", queuePriority: "progress" }
           )
           state.telegramMessageId = result.messageId
           state.lastTelegramUpdateAt = new Date()
@@ -1376,6 +1383,20 @@ export class StreamHandler {
    */
   isProcessing(sessionId: string): boolean {
     return this.states.get(sessionId)?.isProcessing ?? false
+  }
+
+  /**
+   * Mark a session's turn as aborted (Task 02 cancel path).
+   * Resets isProcessing and clears any trailing flush so the idle path
+   * treats the turn as finished — never stuck. Keeps the session
+   * registered so the next message still works (no unregisterSession).
+   */
+  markAborted(sessionId: string): void {
+    this.clearFlushTimer(sessionId)
+    const state = this.states.get(sessionId)
+    if (state) {
+      state.isProcessing = false
+    }
   }
 
   /**

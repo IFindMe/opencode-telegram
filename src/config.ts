@@ -52,15 +52,12 @@ export interface OpenCodeConfig {
   
   /** Startup timeout in milliseconds */
   startupTimeoutMs: number
-  
-  /** Stale topic timeout in milliseconds (topics with no activity will be cleaned up) */
-  staleTopicTimeoutMs: number
-  
-  /** Stale topic cleanup interval in milliseconds */
-  staleTopicCleanupIntervalMs: number
 
   /** Minimum interval between Telegram progress edits in ms (default: 1000, clamped 500-5000 via STREAM_UPDATE_INTERVAL_MS) */
   streamUpdateIntervalMs: number
+
+  /** Bot-wide floor between Telegram API calls in ms (default: 40 ≈ 25 msg/s via TELEGRAM_SEND_INTERVAL_MS) */
+  sendIntervalMs: number
 }
 
 /**
@@ -114,9 +111,8 @@ const DEFAULT_CONFIG: AppConfig = {
     portPoolSize: 100,
     healthCheckIntervalMs: 30_000,
     startupTimeoutMs: 60_000,
-    staleTopicTimeoutMs: 60 * 60 * 1000, // 1 hour
-    staleTopicCleanupIntervalMs: 5 * 60 * 1000, // 5 minutes
     streamUpdateIntervalMs: 1000, // 1s Telegram progress-edit floor (override: STREAM_UPDATE_INTERVAL_MS)
+    sendIntervalMs: 40, // bot-wide pacing ≈25 msg/s (override: TELEGRAM_SEND_INTERVAL_MS)
   },
   storage: {
     orchestratorDbPath: "./data/orchestrator.db",
@@ -151,9 +147,8 @@ export function loadConfig(): AppConfig {
       portPoolSize: parseIntEnv("OPENCODE_PORT_POOL_SIZE", DEFAULT_CONFIG.opencode.portPoolSize),
       healthCheckIntervalMs: parseIntEnv("OPENCODE_HEALTH_CHECK_INTERVAL_MS", DEFAULT_CONFIG.opencode.healthCheckIntervalMs),
       startupTimeoutMs: parseIntEnv("OPENCODE_STARTUP_TIMEOUT_MS", DEFAULT_CONFIG.opencode.startupTimeoutMs),
-      staleTopicTimeoutMs: parseIntEnv("STALE_TOPIC_TIMEOUT_MS", DEFAULT_CONFIG.opencode.staleTopicTimeoutMs),
-      staleTopicCleanupIntervalMs: parseIntEnv("STALE_TOPIC_CLEANUP_INTERVAL_MS", DEFAULT_CONFIG.opencode.staleTopicCleanupIntervalMs),
       streamUpdateIntervalMs: Math.min(5000, Math.max(500, parseIntEnv("STREAM_UPDATE_INTERVAL_MS", DEFAULT_CONFIG.opencode.streamUpdateIntervalMs))),
+      sendIntervalMs: Math.min(1000, Math.max(10, parseIntEnv("TELEGRAM_SEND_INTERVAL_MS", DEFAULT_CONFIG.opencode.sendIntervalMs))),
     },
     storage: {
       orchestratorDbPath: getEnv("ORCHESTRATOR_DB_PATH", DEFAULT_CONFIG.storage.orchestratorDbPath),
@@ -287,8 +282,6 @@ export function printConfig(config: AppConfig): void {
   console.log(`  Max Instances: ${config.opencode.maxInstances}`)
   console.log(`  Idle Timeout: ${config.opencode.idleTimeoutMs / 1000 / 60} minutes`)
   console.log(`  Port Range: ${config.opencode.portStart}-${config.opencode.portStart + config.opencode.portPoolSize - 1}`)
-  console.log(`  Stale Topic Timeout: ${config.opencode.staleTopicTimeoutMs / 1000 / 60} minutes`)
-  console.log(`  Stale Cleanup Interval: ${config.opencode.staleTopicCleanupIntervalMs / 1000 / 60} minutes`)
   
   console.log("\nStorage:")
   console.log(`  Orchestrator DB: ${config.storage.orchestratorDbPath}`)

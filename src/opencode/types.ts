@@ -456,6 +456,12 @@ export type TelegramSendCallback = (
     replyToMessageId?: number
     editMessageId?: number
     inlineKeyboard?: InlineKeyboardButton[][]
+    /**
+     * Send-queue priority hint (task 03): "progress" edits may be coalesced
+     * or skipped when saturated; default "final" is never dropped (queued +
+     * retried). Only the progress-render path sets "progress".
+     */
+    queuePriority?: "progress" | "final"
   }
 ) => Promise<{ messageId: number }>
 

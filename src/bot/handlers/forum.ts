@@ -385,6 +385,8 @@ export interface ForumCommandOptions {
   topicStore?: import("../../forum/topic-store").TopicStore
   /** Callback when streaming preference changes */
   onStreamingToggle?: (chatId: number, topicId: number, enabled: boolean) => void
+  /** Callback to abort the in-flight turn for a topic (Task 02 cancel) */
+  onCancelRequest?: (chatId: number, topicId: number) => Promise<{ ok: boolean; message: string }>
   /** Callback to get all active sessions (managed + external) */
   getActiveSessions?: () => Promise<ActiveSessionInfo[]>
   /** Callback to connect General topic to an existing session */
@@ -473,6 +475,7 @@ export function createForumCommands(topicManagerOrOptions: TopicManager | ForumC
     generalAsControlPlane = false, 
     topicStore, 
     onStreamingToggle,
+    onCancelRequest,
     getActiveSessions,
     connectToSession,
     disconnectSession,
@@ -960,6 +963,49 @@ export function createForumCommands(topicManagerOrOptions: TopicManager | ForumC
   })
 
   /**
+   * Callback query handler for the ⏹ Cancel button on in-flight progress
+   * messages (callback_data `cancel:<sessionId>`). Mirrors the `connect:<n>`
+   * pattern above; the abort itself runs via onCancelRequest (integration
+   * owns the OpenCode client), exactly once — the global callback handler
+   * only handles `perm:` so there is no double-handling.
+   */
+  composer.callbackQuery(/^cancel:(.+)$/, async (ctx) => {
+    const match = ctx.callbackQuery.data.match(/^cancel:(.+)$/)
+    if (!match) {
+      await ctx.answerCallbackQuery({ text: "Invalid button" })
+      return
+    }
+
+    if (!onCancelRequest) {
+      await ctx.answerCallbackQuery({ text: "Cancel not available" })
+      return
+    }
+
+    const chatId = ctx.callbackQuery.message?.chat.id
+    const topicId = (ctx.callbackQuery.message as { message_thread_id?: number } | undefined)?.message_thread_id ?? 0
+    if (!chatId || topicId === 0) {
+      await ctx.answerCallbackQuery({
+        text: "Cancel is only available inside a topic.",
+        show_alert: true,
+      })
+      return
+    }
+
+    try {
+      const result = await onCancelRequest(chatId, topicId)
+      // The outcome (confirmation or polite no-op notice) is already posted
+      // to the topic by the handler; the ack is instant tap feedback only.
+      await ctx.answerCallbackQuery({ text: result.ok ? "⏹ Cancelled" : "Nothing to cancel" })
+    } catch (error) {
+      console.error("[ForumCommands] Error cancelling session:", error)
+      await ctx.answerCallbackQuery({
+        text: "Failed to cancel — try /cancel",
+        show_alert: true,
+      })
+    }
+  })
+
+  /**
    * /disconnect - Disconnect current topic from its session and delete the topic
    * Must be run from within a topic (not General)
    */
@@ -1274,6 +1320,47 @@ export function createForumCommands(topicManagerOrOptions: TopicManager | ForumC
         message_thread_id: topicId 
       }
     )
+  })
+
+  /**
+   * /cancel - Abort the in-flight turn for this topic's session.
+   * Must be run from within a topic (not General). The session stays
+   * registered and usable — the next message starts a fresh turn.
+   */
+  composer.command("cancel", async (ctx) => {
+    if (ctx.chat.type !== "supergroup") {
+      return ctx.reply("This command only works in supergroups with forum topics enabled.")
+    }
+
+    const topicId = ctx.message?.message_thread_id ?? 0
+
+    // Don't allow in General topic (same refusal style as /stream)
+    if (topicId === 0) {
+      return ctx.reply(
+        "Nothing to cancel here. Go to a specific topic with an in-flight turn to cancel it.",
+        { parse_mode: "Markdown" }
+      )
+    }
+
+    if (!onCancelRequest) {
+      return ctx.reply(
+        "Cancel not available.",
+        { message_thread_id: topicId }
+      )
+    }
+
+    try {
+      // The outcome (confirmation or polite no-op notice) is posted to the
+      // topic by the handler itself; no extra reply here (exactly one message).
+      await onCancelRequest(ctx.chat.id, topicId)
+      return
+    } catch (error) {
+      console.error("[ForumCommands] Error cancelling session:", error)
+      return ctx.reply(
+        `Error: ${error instanceof Error ? error.message : String(error)}`,
+        { message_thread_id: topicId }
+      )
+    }
   })
 
   /**

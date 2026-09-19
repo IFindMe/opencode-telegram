@@ -14,6 +14,7 @@
 
 import { loadConfig, validateConfig, printConfig } from "./config"
 import { createIntegratedApp } from "./integration"
+import { acquireBotLock, formatDuplicateBotError, releaseBotLock } from "./bot-guard"
 
 // =============================================================================
 // Main
@@ -56,6 +57,13 @@ async function main() {
     // Ignore errors
   }
 
+  // Duplicate-bot guard: refuse to start while another live poller holds the lock
+  const botLock = acquireBotLock()
+  if (!botLock.acquired) {
+    console.error(formatDuplicateBotError(botLock.stalePid!, botLock.lockfile))
+    process.exit(1)
+  }
+
   // Create the integrated application
   let app: Awaited<ReturnType<typeof createIntegratedApp>> | undefined
   try {
@@ -63,6 +71,7 @@ async function main() {
   } catch (error) {
     console.error("\n[Error] Failed to initialize application:")
     console.error(error instanceof Error ? error.message : String(error))
+    releaseBotLock()
     process.exit(1)
   }
 
@@ -82,6 +91,8 @@ async function main() {
     } catch (error) {
       console.error("[Shutdown] Error:", error)
       process.exit(1)
+    } finally {
+      releaseBotLock()
     }
   }
 
@@ -106,6 +117,7 @@ async function main() {
   } catch (error) {
     console.error("\n[Error] Failed to start application:")
     console.error(error instanceof Error ? error.message : String(error))
+    releaseBotLock()
     process.exit(1)
   }
 }
