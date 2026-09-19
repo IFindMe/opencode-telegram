@@ -964,10 +964,13 @@ export function createForumCommands(topicManagerOrOptions: TopicManager | ForumC
 
   /**
    * Callback query handler for the ⏹ Cancel button on in-flight progress
-   * messages (callback_data `cancel:<sessionId>`). Mirrors the `connect:<n>`
-   * pattern above; the abort itself runs via onCancelRequest (integration
-   * owns the OpenCode client), exactly once — the global callback handler
-   * only handles `perm:` so there is no double-handling.
+   * messages (callback_data `cancel:<sessShort>`, sessShort = sessionId
+   * slice 0:8; legacy `cancel:<fullId>` still accepted — the arg is never
+   * trusted, the session resolves by chat/topic server-side). Mirrors the
+   * `connect:<n>` pattern above; the abort itself runs via onCancelRequest
+   * (integration owns the OpenCode client), exactly once — the global
+   * callback handler only handles `perm:`/`retry:`/`restart:` so there is
+   * no double-handling.
    */
   composer.callbackQuery(/^cancel:(.+)$/, async (ctx) => {
     const match = ctx.callbackQuery.data.match(/^cancel:(.+)$/)

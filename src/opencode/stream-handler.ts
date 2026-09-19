@@ -516,14 +516,17 @@ export class StreamHandler {
       
       try {
         if (state.telegramMessageId) {
-          // Edit the progress message to show final response
+          // Edit the progress message to show final response (P1: strip the
+          // ⏹ Cancel keyboard on the S8 final — buttons change only on the
+          // busy→idle transition).
           await this.sendCallback(
             destination.chatId,
             destination.topicId,
             finalContent,
-            { 
+            {
               parseMode: "HTML",
               editMessageId: state.telegramMessageId,
+              inlineKeyboard: [],
             }
           )
         } else {
@@ -598,9 +601,10 @@ export class StreamHandler {
                 destination.chatId,
                 destination.topicId,
                 finalContent,
-                { 
+                {
                   parseMode: "HTML",
                   editMessageId: state.telegramMessageId,
+                  inlineKeyboard: [],
                 }
               )
               console.log(`[StreamHandler] Final response sent after rate limit wait`)
@@ -646,12 +650,29 @@ export class StreamHandler {
           }
         }
       }
-    } else if (this.config.deleteProgressOnComplete && state.telegramMessageId && this.deleteCallback) {
-      // No text but we have a progress message - delete it
+    } else if (state.telegramMessageId) {
+      // S9: never delete silently — EDIT the card to an explicit
+      // empty-completion receipt (same message, zero new-message cost, final
+      // lane so the receipt is never dropped). Keyboard stripped: nothing to
+      // cancel once the turn is over.
+      const toolCount = state.toolsInvoked.length
+      const receipt = toolCount > 0
+        ? `<i>Done — no text reply. (Tools ran: ${toolCount}. Send another message or /cancel to reset.)</i>`
+        : `<i>Done — nothing to report. Try rephrasing, or send /cancel to reset the turn.</i>`
       try {
-        await this.deleteCallback(destination.chatId, state.telegramMessageId)
+        await this.sendCallback(
+          destination.chatId,
+          destination.topicId,
+          receipt,
+          {
+            parseMode: "HTML",
+            editMessageId: state.telegramMessageId,
+            inlineKeyboard: [],
+          }
+        )
+        this.lastRenderedText.set(sessionId, receipt)
       } catch {
-        // Ignore delete errors
+        // Best-effort receipt; the idle cleanup below still runs.
       }
     }
 
@@ -689,7 +710,63 @@ export class StreamHandler {
   }
 
   /**
-   * Handle session error
+   * P1 (S10/S19): park the live progress card as Stopped (EDIT + strip
+   * keyboard, so no frozen "Thinking" remains), then post the NEW error card
+   * with Retry + Cancel (final priority — never dropped). Callers own
+   * isProcessing/state cleanup; this helper only renders.
+   */
+  private async postStoppedAndErrorCard(
+    sessionId: string,
+    destination: { chatId: number; topicId: number },
+    rawError: string,
+    header = "Something went wrong"
+  ): Promise<void> {
+    const state = this.states.get(sessionId)
+    if (state) {
+      this.clearFlushTimer(sessionId)
+      if (state.telegramMessageId) {
+        try {
+          await this.sendCallback(
+            destination.chatId,
+            destination.topicId,
+            `⏹ <b>Stopped</b>`,
+            {
+              parseMode: "HTML",
+              editMessageId: state.telegramMessageId,
+              inlineKeyboard: [],
+            }
+          )
+          this.lastRenderedText.set(sessionId, `⏹ <b>Stopped</b>`)
+        } catch {
+          // Park is best-effort; the NEW card below is the real receipt.
+        }
+      }
+    }
+    // 120-char slice in <code>; full error stays in server logs only
+    // (secret-leak + length risk). Never-dropped final lane (no progress flag).
+    const errSlice = this.escapeHtml(rawError.slice(0, 120) || "unknown error")
+    const sessShort = sessionId.slice(0, 8)
+    const retryKeyboard: InlineKeyboardButton[][] = [
+      [
+        { text: "🔁 Retry last message", callback_data: `retry:${destination.topicId}` },
+        { text: "⏹ Cancel", callback_data: `cancel:${sessShort}` },
+      ],
+    ]
+    try {
+      await this.sendCallback(
+        destination.chatId,
+        destination.topicId,
+        `❌ <b>${header}</b>\n<code>${errSlice}</code>\n<i>The session is still active.</i>`,
+        { parseMode: "HTML", inlineKeyboard: retryKeyboard }
+      )
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error(`[StreamHandler] Error card send failed: ${msg.slice(0, 120)}`)
+    }
+  }
+
+  /**
+   * Handle session error (S10)
    */
   private async handleSessionError(
     sessionId: string,
@@ -707,28 +784,11 @@ export class StreamHandler {
       state.error = props.error
     }
 
-    // Delete progress message
-    if (
-      state?.telegramMessageId &&
-      this.deleteCallback
-    ) {
-      try {
-        await this.deleteCallback(destination.chatId, state.telegramMessageId)
-      } catch {
-        // Ignore delete errors
-      }
-    }
-
-    // Send error message
-    await this.sendCallback(
-      destination.chatId,
-      destination.topicId,
-      `Error: ${props.error}`,
-      { parseMode: "HTML" }
-    )
+    await this.postStoppedAndErrorCard(sessionId, destination, props.error ?? "unknown error")
 
     // Clean up state
     this.states.delete(sessionId)
+    this.lastRenderedText.delete(sessionId)
   }
 
   /**
@@ -745,13 +805,31 @@ export class StreamHandler {
     }
 
     if (props.status === "running") {
-      // Session started processing
+      // Session started processing — post the live progress card immediately
+      // (S1: NEW with ⏹ Cancel) so tap → silence never exceeds ~1 s. Later
+      // S2–S5 deltas EDIT the same card via the throttled path.
       let state = this.states.get(sessionId)
       if (!state) {
         state = this.createState(sessionId)
         this.states.set(sessionId, state)
       }
       state.isProcessing = true
+      await this.updateTelegram(sessionId, state, destination, true)
+    } else if (props.status === "error") {
+      // S19: session.updated status=error (distinct from session.error event)
+      // — S10-lite: park the progress card as Stopped, then NEW error card
+      // with Retry (final priority, never dropped).
+      await this.postStoppedAndErrorCard(
+        sessionId,
+        destination,
+        ("error" in props && typeof (props as { error?: unknown }).error === "string"
+          ? (props as { error: string }).error
+          : null) ?? "unknown error",
+        "Session error"
+      )
+      const errState = this.states.get(sessionId)
+      if (errState) errState.isProcessing = false
+      this.clearFlushTimer(sessionId)
     }
   }
 
@@ -783,7 +861,12 @@ export class StreamHandler {
       try {
         await this.sendCallback(destination.chatId, destination.topicId,
           `⚠️ <b>OpenCode needs permission</b> but the request couldn't be displayed. Please resend your last message.`,
-          { parseMode: "HTML" })
+          {
+            parseMode: "HTML",
+            inlineKeyboard: [
+              [{ text: "🔁 Resend last message", callback_data: `retry:${destination.topicId}` }],
+            ],
+          })
       } catch { /* best-effort notice */ }
       return
     }
@@ -795,7 +878,12 @@ export class StreamHandler {
       try {
         await this.sendCallback(destination.chatId, destination.topicId,
           `⚠️ <b>OpenCode needs permission</b> but the request couldn't be displayed. Please resend your last message.`,
-          { parseMode: "HTML" })
+          {
+            parseMode: "HTML",
+            inlineKeyboard: [
+              [{ text: "🔁 Resend last message", callback_data: `retry:${destination.topicId}` }],
+            ],
+          })
       } catch { /* best-effort notice */ }
       return
     }
@@ -921,7 +1009,7 @@ export class StreamHandler {
         await this.sendCallback(
           pending.chatId,
           pending.topicId,
-          `⏳ <b>Still waiting for permission:</b> ${this.escapeHtml(pending.permission.title)}\n` +
+          `⏳ <b>Still waiting:</b> ${this.escapeHtml(pending.permission.title)}\n` +
           `<i>Tap Allow/Deny above — the session is paused until you answer.</i>`,
           { parseMode: "HTML" }
         )
@@ -960,18 +1048,23 @@ export class StreamHandler {
     // Clean up pending permission
     const pending = this.pendingPermissions.get(props.permissionID)
     if (pending) {
-      // Optionally update or delete the permission message
-      if (pending.telegramMessageId && this.deleteCallback) {
+      // Receipt (S7): wording matches the button labels exactly; keyboard
+      // stripped on edit (no buttons on receipts).
+      if (pending.telegramMessageId) {
         try {
-          // Edit the message to show it was handled
-          const responseText = props.response === "reject" ? "Denied" : "Approved"
+          const responseText = props.response === "reject"
+            ? "❌ Permission denied"
+            : props.response === "always"
+              ? "✅ Permission granted (always)"
+              : "✅ Permission granted (once)"
           await this.sendCallback(
             pending.chatId,
             pending.topicId,
-            `<i>Permission ${responseText}</i>`,
+            `${responseText}\n\n<i>${this.escapeHtml(pending.permission.title)}</i>`,
             {
               parseMode: "HTML",
               editMessageId: pending.telegramMessageId,
+              inlineKeyboard: [],
             }
           )
         } catch {
@@ -984,42 +1077,87 @@ export class StreamHandler {
   }
 
   /**
-   * Format a permission request message for Telegram
+   * Format a permission request message for Telegram (P1/S6: per-kind copy).
+   * Header states the consequence; unknown kinds keep the generic card
+   * verbatim — never hide an unknown kind behind a pretty template.
    */
   private formatPermissionMessage(permission: Permission): string {
-    const parts: string[] = []
+    const kind = (permission.type ?? "unknown").toLowerCase()
+    const meta = (permission.metadata ?? {}) as Record<string, unknown>
+    const metaStr = (v: unknown): string | null =>
+      typeof v === "string" && v ? v : null
+    const patternStr = permission.pattern
+      ? (Array.isArray(permission.pattern) ? permission.pattern.join(", ") : String(permission.pattern))
+      : null
+    const header = `<b>🔐 Permission needed</b>\nSession paused — answer to continue.`
 
-    parts.push(`<b>🔐 Permission Required</b>`)
+    const withPattern = (lines: string[]): string[] =>
+      patternStr ? [...lines, `<b>Pattern:</b> <code>${this.escapeHtml(patternStr)}</code>`] : lines
+
+    if (kind === "bash") {
+      const cmd = metaStr(meta.command) ?? patternStr ?? permission.title
+      return withPattern([
+        header,
+        ``,
+        `<b>Run command?</b>`,
+        `<pre>${this.escapeHtml(cmd.slice(0, 300))}</pre>`,
+        `<b>Kind:</b> <code>bash</code>`,
+      ]).join("\n")
+    }
+    if (kind === "edit" || kind === "write") {
+      const path = metaStr(meta.path) ?? patternStr ?? permission.title
+      const lines = [header, ``, `<b>Edit file?</b>`, `<b>Path:</b> <code>${this.escapeHtml(path)}</code>`]
+      const diffstat = metaStr(meta.diffstat) ?? metaStr(meta.diffStat) ?? metaStr(meta.stat)
+      if (diffstat) lines.push(`<i>${this.escapeHtml(diffstat.slice(0, 120))}</i>`)
+      return withPattern(lines).join("\n")
+    }
+    if (kind === "read") {
+      const path = metaStr(meta.path) ?? patternStr ?? permission.title
+      return withPattern([
+        header,
+        ``,
+        `<b>Read file?</b>`,
+        `<b>Path:</b> <code>${this.escapeHtml(path)}</code>`,
+      ]).join("\n")
+    }
+    if (kind === "external_directory") {
+      const path = metaStr(meta.path) ?? patternStr ?? permission.title
+      return withPattern([
+        header,
+        ``,
+        `<b>Access outside project?</b>`,
+        `<b>Path:</b> <code>${this.escapeHtml(path)}</code>`,
+        `<i>Only allow if you recognise this path.</i>`,
+      ]).join("\n")
+    }
+    if (kind === "webfetch" || kind === "fetch" || kind.startsWith("network")) {
+      const url = metaStr(meta.url) ?? metaStr(meta.href) ?? metaStr(meta.host) ?? patternStr ?? permission.title
+      return withPattern([
+        header,
+        ``,
+        `<b>Fetch URL?</b>`,
+        `<code>${this.escapeHtml(url.slice(0, 300))}</code>`,
+      ]).join("\n")
+    }
+
+    // Unknown kind: generic card verbatim (current shape, header upgraded).
+    const parts: string[] = []
+    parts.push(header)
     parts.push("")
     parts.push(`<b>Type:</b> <code>${this.escapeHtml(permission.type)}</code>`)
     parts.push(`<b>Action:</b> ${this.escapeHtml(permission.title)}`)
-
-    // Show pattern if available (e.g., for bash commands)
-    if (permission.pattern) {
-      const pattern = Array.isArray(permission.pattern) 
-        ? permission.pattern.join(", ") 
-        : permission.pattern
-      parts.push(`<b>Pattern:</b> <code>${this.escapeHtml(pattern)}</code>`)
+    if (patternStr) {
+      parts.push(`<b>Pattern:</b> <code>${this.escapeHtml(patternStr)}</code>`)
     }
-
-    // Show relevant metadata
-    if (permission.metadata) {
-      const { command, args, path } = permission.metadata as {
-        command?: string
-        args?: Record<string, unknown>
-        path?: string
-      }
-
-      if (command) {
-        parts.push("")
-        parts.push(`<pre>${this.escapeHtml(String(command))}</pre>`)
-      }
-
-      if (path) {
-        parts.push(`<b>Path:</b> <code>${this.escapeHtml(String(path))}</code>`)
-      }
+    const command = metaStr(meta.command)
+    if (command) {
+      parts.push("")
+      parts.push(`<pre>${this.escapeHtml(command)}</pre>`)
     }
-
+    const path = metaStr(meta.path)
+    if (path) {
+      parts.push(`<b>Path:</b> <code>${this.escapeHtml(path)}</code>`)
+    }
     return parts.join("\n")
   }
 
@@ -1125,7 +1263,12 @@ export class StreamHandler {
           destination.topicId,
           `⚠️ Permission request expired: the OpenCode session restarted and the pending approval can no longer be answered.\n\n` +
           `Please resend your message.`,
-          { parseMode: "HTML" }
+          {
+            parseMode: "HTML",
+            inlineKeyboard: [
+              [{ text: "🔁 Resend last message", callback_data: `retry:${destination.topicId}` }],
+            ],
+          }
         )
       } catch { /* best-effort notice */ }
       return true
@@ -1273,10 +1416,14 @@ export class StreamHandler {
     }
     
     const progressText = this.formatProgressMessage(state, sessionId)
-    // Task 02: in-flight progress carries a ⏹ Cancel button
-    // (callback_data follows the namespaced `perm:<...>` convention).
+    // P1 (E1/S1): in-flight progress carries a ⏹ Cancel button, attached on
+    // card creation only (edits omit markup to stay inside the ~1/s budget).
+    // sessShort = sessionId slice 0:8 — server resolves the full session by
+    // topic, keeping callback_data far under 64 bytes. Legacy full-id
+    // callbacks remain accepted by the topic-resolved handler.
+    const sessShort = sessionId.slice(0, 8)
     const cancelKeyboard: InlineKeyboardButton[][] = [
-      [{ text: "⏹ Cancel", callback_data: `cancel:${sessionId}` }],
+      [{ text: "⏹ Cancel", callback_data: `cancel:${sessShort}` }],
     ]
     // Dirty check: skip the edit when the formatted text is unchanged since
     // the last successful render — avoids useless edits burning rate budget.
@@ -1288,7 +1435,10 @@ export class StreamHandler {
     try {
       if (state.telegramMessageId) {
         // Edit existing message (progress class: skippable when saturated;
-        // finals/cards/notices default to the never-drop class)
+        // finals/cards/notices default to the never-drop class). The Cancel
+        // keyboard rides this already-happening text edit (zero extra calls,
+        // dirty-check still gates) so a card stripped by a prior receipt
+        // re-arms on the next turn's first progress edit.
         await this.sendCallback(
           destination.chatId,
           destination.topicId,
@@ -1297,18 +1447,20 @@ export class StreamHandler {
             parseMode: "HTML",
             editMessageId: state.telegramMessageId,
             queuePriority: "progress",
+            inlineKeyboard: state.isProcessing ? cancelKeyboard : [],
           }
         )
       } else {
         // Mark that we're sending to prevent duplicate sends
         state.pendingSend = true
         try {
-          // Send new message
+          // Send new message (P1: attach ⏹ Cancel at creation; progress
+          // priority — skippable when saturated, never-drop lane is for finals)
           const result = await this.sendCallback(
             destination.chatId,
             destination.topicId,
             progressText,
-            { parseMode: "HTML", queuePriority: "progress" }
+            { parseMode: "HTML", queuePriority: "progress", inlineKeyboard: cancelKeyboard }
           )
           state.telegramMessageId = result.messageId
         } finally {
@@ -1346,7 +1498,7 @@ export class StreamHandler {
             destination.chatId,
             destination.topicId,
             progressText,
-            { parseMode: "HTML", queuePriority: "progress" }
+            { parseMode: "HTML", queuePriority: "progress", inlineKeyboard: cancelKeyboard }
           )
           state.telegramMessageId = result.messageId
           state.lastTelegramUpdateAt = new Date()

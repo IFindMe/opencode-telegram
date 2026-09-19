@@ -275,6 +275,9 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
 
   // Set up session idle callback to update topic names after first message
   streamHandler.setOnSessionIdle(async (sessionId, chatId, topicId) => {
+    // P1 (I-2): turn boundary — stop the typing heartbeat promptly (the
+    // interval also self-terminates on its next tick via the busy check).
+    stopTypingHeartbeat(topicId)
     // H3: response completed — the tracked prompt is no longer orphanable.
     const tracked = lastPromptByTopic.get(topicId)
     if (tracked && tracked.sessionId === sessionId) {
@@ -389,13 +392,19 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     if (topicIds.size === 0) return
     const chatId = config.telegram.chatId
     for (const topicId of topicIds) {
+      // P1/S14: standard loss card (NEW, final lane) with reconnect affordance.
+      stopTypingHeartbeat(topicId)
       try {
-        await sendToTopic(
-          bot,
+        await sendCallback(
           chatId,
           topicId,
-          `⚠️ Lost live connection to OpenCode (${errMsg.slice(0, 120)}).\n\n` +
-          `Your last message may not complete. Check /status in General — a restart may be needed to restore live updates.`
+          `🔌 <b>Live updates interrupted</b>\n<i>Check /status in General — a restart may be needed to restore live updates.</i>`,
+          {
+            parseMode: "HTML",
+            inlineKeyboard: [
+              [{ text: "🔄 Reconnect", callback_data: `restart:${topicId}` }],
+            ],
+          }
         )
       } catch (notifyError) {
         console.error(`[Integration] Failed to send SSE-loss notice to topic ${topicId}:`, notifyError)
@@ -650,13 +659,18 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
             // Notice-only: no auto-resend (duplicate-prompt risk).
             const hadActive = prevHadActiveSnapshot || pending?.hadActive === true
             if (recent && hadActive) {
+              // P1/S13: same text, one-tap Retry added (NEW, final lane).
               try {
-                await sendToTopic(
-                  bot,
+                await sendCallback(
                   config.telegram.chatId,
                   readyTopicId,
-                  `🔄 OpenCode restarted and your last message may not have completed. ` +
-                  `Please resend it if no response appears.`
+                  `🔄 <b>OpenCode restarted.</b> Your last message may not have completed — tap to resend, or ignore if a reply appears.`,
+                  {
+                    parseMode: "HTML",
+                    inlineKeyboard: [
+                      [{ text: "🔁 Resend last message", callback_data: `retry:${readyTopicId}` }],
+                    ],
+                  }
                 )
               } catch (notifyError) {
                 console.error(`[Integration] Failed to send restart notice to topic ${readyTopicId}:`, notifyError)
@@ -693,21 +707,51 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           }
         }
 
-        // Notify in Telegram if crashed
+        // Notify in Telegram if crashed (P1/S12: standard crash card, NEW,
+        // final lane via sendCallback so it is never dropped; Retry on
+        // willRestart, one-tap restart affordance otherwise).
         if (event.type === "instance:crashed") {
           const instance = instanceManager.getInstance(event.instanceId)
           if (instance) {
+            stopTypingHeartbeat(instance.config.topicId)
             const crashEvent = event as { error: string; willRestart: boolean }
-            const message = crashEvent.willRestart
-              ? `Instance crashed, restarting... (${crashEvent.error})`
-              : `Instance crashed: ${crashEvent.error}`
-            
-            await sendToTopic(
-              bot,
-              config.telegram.chatId,
-              instance.config.topicId,
-              message
-            )
+            const errSlice = escapeHtmlCard(String(crashEvent.error ?? "unknown error").slice(0, 120))
+            const topicId = instance.config.topicId
+            if (crashEvent.willRestart) {
+              try {
+                await sendCallback(
+                  config.telegram.chatId,
+                  topicId,
+                  `⚠️ <b>OpenCode instance crashed</b>\n<code>${errSlice}</code>\n` +
+                  `<i>Restarting… your session will resume. Resend your last message if no reply appears.</i>`,
+                  {
+                    parseMode: "HTML",
+                    inlineKeyboard: [
+                      [{ text: "🔁 Resend last message", callback_data: `retry:${topicId}` }],
+                    ],
+                  }
+                )
+              } catch (notifyError) {
+                console.error(`[Integration] Failed to send crash notice to topic ${topicId}:`, notifyError)
+              }
+            } else {
+              try {
+                await sendCallback(
+                  config.telegram.chatId,
+                  topicId,
+                  `⚠️ <b>OpenCode instance crashed</b>\n<code>${errSlice}</code>\n` +
+                  `<i>It will not restart automatically. Send a message to start a fresh session.</i>`,
+                  {
+                    parseMode: "HTML",
+                    inlineKeyboard: [
+                      [{ text: "🔄 Start fresh session", callback_data: `restart:${topicId}` }],
+                    ],
+                  }
+                )
+              } catch (notifyError) {
+                console.error(`[Integration] Failed to send crash notice to topic ${topicId}:`, notifyError)
+              }
+            }
           }
         }
         break
@@ -716,11 +760,14 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       case "instance:idle-timeout": {
         const instance = instanceManager.getInstance(event.instanceId)
         if (instance) {
+          stopTypingHeartbeat(instance.config.topicId)
+          // P1/S15: standard copy (button-free NEW — any message restarts).
           await sendToTopic(
             bot,
             config.telegram.chatId,
             instance.config.topicId,
-            "Session stopped due to inactivity. Send a message to restart."
+            `💤 <b>Session paused (inactive).</b> Send any message to restart — history is kept.`,
+            "HTML"
           )
         }
         break
@@ -746,6 +793,46 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       // Ignore lookup errors — treat as idle, timer path delivers.
     }
     return false
+  }
+
+  // P1 (I-2): typing-indicator heartbeat, one ~4s interval per busy topic.
+  // Purely additive: best-effort sendChatAction, never blocks sends, never
+  // logged with text. Self-terminating — each tick re-checks
+  // isTopicSessionBusy and stops when the turn ends, so a missed stop event
+  // can only leave one stray 4s blip. Rate math: 1 action / 4s / busy topic;
+  // 10 concurrent busy topics ≈ 2.5 actions/s, far under Telegram's ~30/s
+  // group budget and orthogonal to the 1/s per-message edit floor.
+  const typingTimers = new Map<number, ReturnType<typeof setInterval>>()
+  function startTypingHeartbeat(chatId: number, topicId: number): void {
+    if (typingTimers.has(topicId)) return
+    void bot.api.sendChatAction(chatId, "typing", { message_thread_id: topicId || undefined }).catch(() => {})
+    const timer = setInterval(() => {
+      if (!isTopicSessionBusy(chatId, topicId)) {
+        stopTypingHeartbeat(topicId)
+        return
+      }
+      void bot.api.sendChatAction(chatId, "typing", { message_thread_id: topicId || undefined }).catch(() => {})
+    }, 4000)
+    if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+      (timer as unknown as { unref: () => void }).unref()
+    }
+    typingTimers.set(topicId, timer)
+  }
+  function stopTypingHeartbeat(topicId: number): void {
+    const timer = typingTimers.get(topicId)
+    if (timer) {
+      clearInterval(timer)
+      typingTimers.delete(topicId)
+    }
+  }
+
+  /** P1: escape &<>" for Telegram HTML cards (ids/errors only, never secrets). */
+  function escapeHtmlCard(text: string): string {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
   }
 
   // Task 04: drop a topic's buffered burst (timer + parts). Called on topic
@@ -844,6 +931,7 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       }
       const success = await apiServer.routeMessageToExternal(effectiveTopicId, text)
       if (success) {
+        startTypingHeartbeat(chatId, effectiveTopicId)
         return { success: true, sessionId: external?.sessionId }
       } else {
         await sendToTopic(bot, chatId, effectiveTopicId, "Failed to send message to external OpenCode instance.")
@@ -865,6 +953,7 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           console.log(`[Integration] Sent message to discovered session ${mapping.sessionId}`)
           // H3: track last accepted prompt for orphan detection on restart.
           lastPromptByTopic.set(effectiveTopicId, { text, sessionId: mapping.sessionId, at: Date.now(), hadActive: false })
+          startTypingHeartbeat(chatId, effectiveTopicId)
           return { success: true, sessionId: mapping.sessionId }
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error)
@@ -942,10 +1031,12 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
                 console.log(`[Integration] Reconnected and sent message to session ${reconnectSession.id}`)
                 // H3: track last accepted prompt for orphan detection on restart.
                 lastPromptByTopic.set(effectiveTopicId, { text, sessionId: reconnectSession.id, at: Date.now(), hadActive: false })
+                startTypingHeartbeat(chatId, effectiveTopicId)
                 
-                // Notify user of successful reconnection
-                await sendToTopic(bot, chatId, effectiveTopicId, 
-                  "🔄 Reconnected to OpenCode session."
+                // Notify user of successful reconnection (P1/S14 standard copy)
+                await sendToTopic(bot, chatId, effectiveTopicId,
+                  `✅ <b>Reconnected</b> <i>— live updates resumed.</i>`,
+                  "HTML"
                 )
                 
                 return { success: true, sessionId: reconnectSession.id }
@@ -1041,9 +1132,11 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
           console.log(`[Integration] Connected to existing TUI and sent message to session ${existingSession.id}`)
           // H3: track last accepted prompt for orphan detection on restart.
           lastPromptByTopic.set(effectiveTopicId, { text, sessionId: existingSession.id, at: Date.now(), hadActive: false })
+          startTypingHeartbeat(chatId, effectiveTopicId)
           
-          await sendToTopic(bot, chatId, effectiveTopicId, 
-            "🔄 Reconnected to OpenCode TUI."
+          await sendToTopic(bot, chatId, effectiveTopicId,
+            `✅ <b>Reconnected</b> <i>— live updates resumed.</i>`,
+            "HTML"
           )
           
           return { success: true, sessionId: existingSession.id }
@@ -1121,6 +1214,7 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       }
       // H3: track last accepted prompt for orphan detection on restart.
       lastPromptByTopic.set(effectiveTopicId, { text, sessionId: currentInstance.sessionId, at: Date.now(), hadActive: false })
+      startTypingHeartbeat(chatId, effectiveTopicId)
       return { success: true, sessionId: currentInstance.sessionId }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
@@ -1728,10 +1822,29 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     }
 
     streamHandler.markAborted(sessionId)
+    stopTypingHeartbeat(topicId)
     // Task 04: abort-aware boundary — buffered text survives the abort; flush
     // promptly as ONE joined prompt (the next turn) instead of waiting out
     // the window. Permission cards are untouched (stream-handler-owned).
     void flushCoalescedTopic(topicId)
+    // P1/S11: the edited card IS the receipt — EDIT the progress card in
+    // place and strip its keyboard (prevents double-tap races; a second tap
+    // lands on the idle path with "Nothing to cancel"). NEW only when there
+    // is no card to edit (e.g. /cancel with no visible progress).
+    const progressId = streamHandler.getState(sessionId)?.telegramMessageId
+    if (progressId) {
+      try {
+        await sendCallback(
+          chatId,
+          topicId,
+          `⏹ <b>Cancelled</b> <i>— session still active.</i>`,
+          { parseMode: "HTML", editMessageId: progressId, inlineKeyboard: [] }
+        )
+        return { ok: true, message: "⏹ Cancelled — session still active, send a new message." }
+      } catch {
+        // Edit failed (card deleted) — fall through to the NEW one-liner.
+      }
+    }
     const message = "⏹ Cancelled — session still active, send a new message."
     await sendToTopic(bot, chatId, topicId, message)
     return { ok: true, message }
@@ -1859,12 +1972,17 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         console.error(`[Integration] No client found for session ${pending.permission.sessionID} (topic ${pending.topicId})`)
         await ctx.answerCallbackQuery({ text: "Session not found — see topic for details", show_alert: true })
         try {
-          await sendToTopic(
-            bot,
+          await sendCallback(
             pending.chatId,
             pending.topicId,
             `⚠️ Permission request expired: the OpenCode session restarted and the pending approval can no longer be answered.\n\n` +
-            `Please resend your message.`
+            `Please resend your message.`,
+            {
+              parseMode: "HTML",
+              inlineKeyboard: [
+                [{ text: "🔁 Resend last message", callback_data: `retry:${pending.topicId}` }],
+              ],
+            }
           )
         } catch (notifyError) {
           console.error(`[Integration] Failed to send permission-expired notice:`, notifyError)
@@ -1909,6 +2027,112 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         })
       }
 
+      return
+    }
+
+    // P1 (I-1): 🔁 Retry — re-sends the topic's last prompt via the normal
+    // send path (server-side text lookup; no prompt text in callback data).
+    // Exactly-once: taps while the session is busy are ignored (no
+    // duplicate-send), and a completed turn has no tracked prompt left
+    // (cleared on idle) so it can never be re-sent — the user gets an
+    // explicit notice instead. NEVER auto-resends silently: every tap ends
+    // in an ack popup and/or a visible topic notice.
+    if (data.startsWith("retry:")) {
+      const retryTopicId = parseInt(data.slice("retry:".length), 10)
+      const chatId = ctx.callbackQuery.message?.chat.id
+      if (!chatId || !Number.isFinite(retryTopicId)) {
+        await ctx.answerCallbackQuery({ text: "Invalid retry button" })
+        return
+      }
+      // Busy → duplicate tap: ack only, never re-send.
+      if (isTopicSessionBusy(chatId, retryTopicId)) {
+        await ctx.answerCallbackQuery({ text: "Already running — tap ignored" })
+        return
+      }
+      const pending = lastPromptByTopic.get(retryTopicId)
+      if (!pending) {
+        // No tracked prompt: the turn already completed (idle clears the
+        // entry) — re-sending would duplicate a finished answer.
+        await ctx.answerCallbackQuery({ text: "Already completed — nothing to resend" })
+        try {
+          await sendToTopic(
+            bot,
+            chatId,
+            retryTopicId,
+            `✅ Already completed — no need to resend. Send a new message if you'd like to follow up.`
+          )
+        } catch (notifyError) {
+          console.error(`[Integration] Failed to send retry-completed notice:`, notifyError)
+        }
+        return
+      }
+      if (Date.now() - pending.at > 10 * 60 * 1000) {
+        // Stale prompt (same 10-min window as the H3 restart notice) —
+        // re-sending ancient text would surprise; ask for a manual resend.
+        await ctx.answerCallbackQuery({ text: "Too old to resend automatically" })
+        try {
+          await sendToTopic(
+            bot,
+            chatId,
+            retryTopicId,
+            `⏳ That message is too old to resend automatically — please send it again.`
+          )
+        } catch (notifyError) {
+          console.error(`[Integration] Failed to send retry-stale notice:`, notifyError)
+        }
+        return
+      }
+      await ctx.answerCallbackQuery({ text: "Resending…" })
+      try {
+        // Immediate resend through the unchanged router (owns echo guard,
+        // system-prompt injection, lastPromptByTopic, typing heartbeat).
+        // Bypasses the coalescing window — the tap IS the explicit confirm.
+        // Log lengths only, never message text (secrets).
+        console.log(`[Integration] Retry tap resending topic ${retryTopicId} (len=${pending.text.length})`)
+        await routeMessageToInstance({
+          messageId: 0,
+          chatId,
+          topicId: retryTopicId,
+          userId: ctx.from?.id ?? 0,
+          text: pending.text,
+          isGeneralTopic: false,
+          isReply: false,
+        })
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        console.error(`[Integration] Retry resend failed for topic ${retryTopicId}: ${reason.slice(0, 120)}`)
+        try {
+          await sendToTopic(bot, chatId, retryTopicId, `❌ Retry failed (${reason.slice(0, 80)}) — please send your message again.`)
+        } catch {
+          // Best-effort failure notice.
+        }
+      }
+      return
+    }
+
+    // P1 (S12/S14 affordance): 🔄 Restart — P2 (I-5) will make this start a
+    // fresh session one-tap. P1 keeps the button honest: instant ack + an
+    // explicit NEW notice with the next step (any message starts fresh).
+    // Never a dead tap, never silent.
+    if (data.startsWith("restart:")) {
+      const restartTopicId = parseInt(data.slice("restart:".length), 10)
+      const chatId = ctx.callbackQuery.message?.chat.id
+      if (!chatId || !Number.isFinite(restartTopicId)) {
+        await ctx.answerCallbackQuery({ text: "Invalid button" })
+        return
+      }
+      await ctx.answerCallbackQuery({ text: "Restarting…" })
+      try {
+        await sendToTopic(
+          bot,
+          chatId,
+          restartTopicId,
+          `🔄 <b>Restart requested.</b> Send any message to start a fresh session — history is kept.`,
+          "HTML"
+        )
+      } catch (notifyError) {
+        console.error(`[Integration] Failed to send restart notice:`, notifyError)
+      }
       return
     }
 
