@@ -2110,10 +2110,79 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       return
     }
 
-    // P1 (S12/S14 affordance): 🔄 Restart — P2 (I-5) will make this start a
-    // fresh session one-tap. P1 keeps the button honest: instant ack + an
-    // explicit NEW notice with the next step (any message starts fresh).
-    // Never a dead tap, never silent.
+    // P2 (I-3): Full-output toggle — expands a truncated final in place
+    // from the server-side turn store (already-received SSE state, never
+    // fetched). `full:<key>:<i>` expands, `fullx:<key>:<i>` collapses back
+    // (index 0 = answer body; anything else is answered visibly, never
+    // silent). Callbacks stay ~15 B. Exactly one answerCallbackQuery per tap
+    // (fast tap feedback); follow-up edits ride the never-drop final lane.
+    if (data.startsWith("full:") || data.startsWith("fullx:")) {
+      const collapsing = data.startsWith("fullx:")
+      const arg = data.slice(collapsing ? "fullx:".length : "full:".length)
+      const sep = arg.lastIndexOf(":")
+      const chatId = ctx.callbackQuery.message?.chat.id
+      const turnKey = sep >= 0 ? arg.slice(0, sep) : ""
+      const index = sep >= 0 ? parseInt(arg.slice(sep + 1), 10) : NaN
+      if (!chatId || !turnKey) {
+        await ctx.answerCallbackQuery({ text: "Invalid button" })
+        return
+      }
+      if (index !== 0) {
+        await ctx.answerCallbackQuery({ text: "Unknown expansion", show_alert: true })
+        return
+      }
+      const entry = streamHandler.getTurnEntry(turnKey, chatId)
+      if (!entry) {
+        // Ring-evicted or unknown key — visible alert, never silent.
+        await ctx.answerCallbackQuery({ text: "That turn expired — full output no longer available", show_alert: true })
+        return
+      }
+      await ctx.answerCallbackQuery({ text: collapsing ? "Collapsed" : "Expanded" })
+      try {
+        if (collapsing) {
+          await sendCallback(chatId, entry.topicId, entry.collapsedHtml, {
+            parseMode: "HTML",
+            editMessageId: entry.messageId,
+            inlineKeyboard: streamHandler.turnExpandKeyboard(turnKey),
+          })
+          streamHandler.setTurnExpanded(turnKey, chatId, false)
+        } else {
+          const { main, followUp } = streamHandler.composeTurnExpansion(entry)
+          await sendCallback(chatId, entry.topicId, main, {
+            parseMode: "HTML",
+            editMessageId: entry.messageId,
+            inlineKeyboard: streamHandler.turnCollapseKeyboard(turnKey),
+          })
+          streamHandler.setTurnExpanded(turnKey, chatId, true)
+          if (followUp) {
+            await sendCallback(chatId, entry.topicId, followUp, { parseMode: "HTML" })
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        console.error(`[Integration] Full-output toggle failed for ${turnKey}: ${reason.slice(0, 120)}`)
+        // Single ack already sent — surface visibly as a topic notice.
+        try {
+          await sendToTopic(
+            bot,
+            chatId,
+            entry.topicId,
+            `⚠️ Couldn't update the message — tap again, or scroll up for the condensed answer.`
+          )
+        } catch {
+          // Best-effort notice.
+        }
+      }
+      return
+    }
+
+    // P2 (I-5): 🔄 Restart — true one-tap fresh-session start. Resolves the
+    // topic's workDir exactly like the message path (mapping workDir, else
+    // basePath/topicName), then getOrCreateInstance (restarts crashed/
+    // stopped/failed, starts missing, returns healthy). The instance:ready
+    // wiring (session creation, SSE subscribe, notices) is reused untouched.
+    // Every tap ends in an ack popup + a visible topic notice — never a dead
+    // tap, never silent.
     if (data.startsWith("restart:")) {
       const restartTopicId = parseInt(data.slice("restart:".length), 10)
       const chatId = ctx.callbackQuery.message?.chat.id
@@ -2121,17 +2190,72 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         await ctx.answerCallbackQuery({ text: "Invalid button" })
         return
       }
+      const current = instanceManager.getInstanceByTopic(restartTopicId)
+      if (current && (current.state === "running" || current.state === "starting")) {
+        await ctx.answerCallbackQuery({ text: "Already running" })
+        try {
+          await sendToTopic(
+            bot,
+            chatId,
+            restartTopicId,
+            `✅ Session is already running — send a message to continue.`
+          )
+        } catch (notifyError) {
+          console.error(`[Integration] Failed to send restart-unneeded notice:`, notifyError)
+        }
+        return
+      }
       await ctx.answerCallbackQuery({ text: "Restarting…" })
+      const mapping = topicStore.getMapping(chatId, restartTopicId)
+      const topicName = mapping?.topicName
+      const workDir = mapping?.workDir ?? (topicName ? `${config.project.basePath}/${topicName}` : undefined)
+      if (!workDir) {
+        try {
+          await sendToTopic(
+            bot,
+            chatId,
+            restartTopicId,
+            `⚠️ Couldn't determine this topic's project directory — send any message to start a fresh session.`
+          )
+        } catch {
+          // Best-effort notice.
+        }
+        return
+      }
+      if (!mapping?.workDir && config.project.autoCreateDirs) {
+        try {
+          await Bun.$`mkdir -p ${workDir}`.quiet()
+        } catch {
+          // The start below surfaces real failures.
+        }
+      }
       try {
+        const instance = await instanceManager.getOrCreateInstance(
+          restartTopicId,
+          workDir,
+          topicName ? { name: topicName } : {}
+        )
+        if (!instance) throw new Error("instance start failed")
         await sendToTopic(
           bot,
           chatId,
           restartTopicId,
-          `🔄 <b>Restart requested.</b> Send any message to start a fresh session — history is kept.`,
+          `🔄 <b>Session restarted.</b> Send a message to begin — history is kept.`,
           "HTML"
         )
-      } catch (notifyError) {
-        console.error(`[Integration] Failed to send restart notice:`, notifyError)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        console.error(`[Integration] Restart tap failed for topic ${restartTopicId}: ${reason.slice(0, 120)}`)
+        try {
+          await sendToTopic(
+            bot,
+            chatId,
+            restartTopicId,
+            `❌ Restart failed (${reason.slice(0, 80)}) — send any message to try starting fresh.`
+          )
+        } catch {
+          // Best-effort notice.
+        }
       }
       return
     }
