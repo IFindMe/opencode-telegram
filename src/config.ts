@@ -58,6 +58,9 @@ export interface OpenCodeConfig {
 
   /** Bot-wide floor between Telegram API calls in ms (default: 40 ≈ 25 msg/s via TELEGRAM_SEND_INTERVAL_MS) */
   sendIntervalMs: number
+
+  /** Permission types auto-answered "once" without asking (default: read-only; unknown kinds always ask; override: PERMISSIONS_AUTO_ALLOW) */
+  permissionsAutoAllow: string[]
 }
 
 /**
@@ -113,6 +116,7 @@ const DEFAULT_CONFIG: AppConfig = {
     startupTimeoutMs: 60_000,
     streamUpdateIntervalMs: 1000, // 1s Telegram progress-edit floor (override: STREAM_UPDATE_INTERVAL_MS)
     sendIntervalMs: 40, // bot-wide pacing ≈25 msg/s (override: TELEGRAM_SEND_INTERVAL_MS)
+    permissionsAutoAllow: ["read", "glob", "grep", "list", "lsp"], // read-only auto-allow; write/exec/network/external_directory ask (override: PERMISSIONS_AUTO_ALLOW)
   },
   storage: {
     orchestratorDbPath: "./data/orchestrator.db",
@@ -149,6 +153,7 @@ export function loadConfig(): AppConfig {
       startupTimeoutMs: parseIntEnv("OPENCODE_STARTUP_TIMEOUT_MS", DEFAULT_CONFIG.opencode.startupTimeoutMs),
       streamUpdateIntervalMs: Math.min(5000, Math.max(500, parseIntEnv("STREAM_UPDATE_INTERVAL_MS", DEFAULT_CONFIG.opencode.streamUpdateIntervalMs))),
       sendIntervalMs: Math.min(1000, Math.max(10, parseIntEnv("TELEGRAM_SEND_INTERVAL_MS", DEFAULT_CONFIG.opencode.sendIntervalMs))),
+      permissionsAutoAllow: parseStringListEnv("PERMISSIONS_AUTO_ALLOW", DEFAULT_CONFIG.opencode.permissionsAutoAllow),
     },
     storage: {
       orchestratorDbPath: getEnv("ORCHESTRATOR_DB_PATH", DEFAULT_CONFIG.storage.orchestratorDbPath),
@@ -262,6 +267,20 @@ function parseIntArrayEnv(key: string): number[] {
     .filter((n) => !isNaN(n))
 }
 
+/**
+ * Parse a comma-separated string list (total, side-effect-free).
+ * Unset → copy of the default; set-but-empty → [] (deny all).
+ * Entries are trimmed + lowercased for case-insensitive matching.
+ */
+function parseStringListEnv(key: string, defaultValue: string[]): string[] {
+  const value = process.env[key]
+  if (value === undefined) return [...defaultValue]
+  return value
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0)
+}
+
 // =============================================================================
 // Configuration Display
 // =============================================================================
@@ -282,6 +301,7 @@ export function printConfig(config: AppConfig): void {
   console.log(`  Max Instances: ${config.opencode.maxInstances}`)
   console.log(`  Idle Timeout: ${config.opencode.idleTimeoutMs / 1000 / 60} minutes`)
   console.log(`  Port Range: ${config.opencode.portStart}-${config.opencode.portStart + config.opencode.portPoolSize - 1}`)
+  console.log(`  Permissions Auto-allow: ${config.opencode.permissionsAutoAllow.length > 0 ? config.opencode.permissionsAutoAllow.join(", ") : "(none — all ask)"}`)
   
   console.log("\nStorage:")
   console.log(`  Orchestrator DB: ${config.storage.orchestratorDbPath}`)

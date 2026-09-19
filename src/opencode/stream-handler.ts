@@ -66,6 +66,19 @@ export class StreamHandler {
   /** Reminder timers for pending permissions - keyed by permissionId (H2) */
   private readonly permissionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
 
+  /** Task 05: permission types auto-answered "once" (lowercased exact match; empty = deny all). Set via setPermissionsAutoAllow. */
+  private permissionsAutoAllow = new Set<string>()
+
+  /** Task 05: injected OpenCode responder for auto-allow (integration-owned resolve chain). Unset = ask (never auto-allow without an API path). */
+  private permissionAutoResponder?: (
+    sessionId: string,
+    permissionId: string,
+    destination: { chatId: number; topicId: number }
+  ) => Promise<boolean>
+
+  /** Task 05: recently auto-allowed permission ids (suppresses asked/updated duplicates; ids are unique per request; capped). */
+  private readonly autoAllowedPermissionIds = new Set<string>()
+
   /** One-shot trailing-flush timers - keyed by sessionId (at most one per session) */
   private readonly flushTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
 
@@ -809,6 +822,17 @@ export class StreamHandler {
         : {}),
     }
 
+    // Task 05: allowlist check — AFTER envelope validation, BEFORE card send.
+    // Default-deny: only an explicit rule match auto-answers "once"; unknown
+    // kinds keep the ask flow below byte-identical. True = no card (answered,
+    // duplicate-suppressed, or loudly notified); false = fall through to card
+    // (only when no API path is configured — safe ask).
+    if (this.isPermissionAutoAllowed(kind)) {
+      if (await this.tryAutoAllowPermission(display, kind, destination)) {
+        return
+      }
+    }
+
     console.log(`[StreamHandler] Permission request (${event.type}): ${display.type} - ${display.title}`)
 
     // Format permission message
@@ -1012,6 +1036,135 @@ export class StreamHandler {
   removePendingPermission(permissionId: string): void {
     this.clearPermissionTimer(permissionId)
     this.pendingPermissions.delete(permissionId)
+  }
+
+  /**
+   * Task 05: configure which permission kinds auto-answer "once".
+   * Matching is case-insensitive exact-match on the coalesced kind;
+   * anything not listed (including unknown kinds) keeps the ask flow.
+   */
+  setPermissionsAutoAllow(kinds: string[]): void {
+    this.permissionsAutoAllow = new Set(kinds.map((k) => k.toLowerCase()))
+  }
+
+  /**
+   * Task 05: inject the OpenCode responder used for auto-allow.
+   * Owned by integration.ts so TUI/discovered/restarted sessions resolve
+   * identically to manual Allow-Once. Resolves true when "once" was accepted.
+   */
+  setPermissionAutoResponder(
+    responder: (
+      sessionId: string,
+      permissionId: string,
+      destination: { chatId: number; topicId: number }
+    ) => Promise<boolean>
+  ): void {
+    this.permissionAutoResponder = responder
+  }
+
+  /**
+   * Task 05: default-deny matcher — true only on explicit rule match.
+   */
+  isPermissionAutoAllowed(kind: string): boolean {
+    return this.permissionsAutoAllow.has(kind.toLowerCase())
+  }
+
+  /**
+   * Task 05: auto-answer a matching permission with "once" via the injected
+   * responder. Skips the card, never creates a pending entry or reminder
+   * timer. Returns true when no card should be created (answered,
+   * duplicate-suppressed, or loudly notified on failure); false only when no
+   * API path is configured, letting the caller fall through to the ask flow.
+   */
+  private async tryAutoAllowPermission(
+    display: Permission,
+    kind: string,
+    destination: { chatId: number; topicId: number }
+  ): Promise<boolean> {
+    const permissionId = display.id
+    const sessionId = display.sessionID
+
+    // Duplicate suppression: `.asked` and `.updated` may both fire for one
+    // request — the first success already answered "once", never call twice.
+    if (this.autoAllowedPermissionIds.has(permissionId)) {
+      console.log(`[StreamHandler] Permission ${permissionId} already auto-allowed, skipping duplicate`)
+      return true
+    }
+
+    // No API path (integration didn't inject) — fall through to the card.
+    if (!this.permissionAutoResponder) {
+      console.warn(`[StreamHandler] Permission ${permissionId} matched allowlist (${kind}) but no auto-responder is configured — falling through to ask flow`)
+      return false
+    }
+
+    const patternStr = Array.isArray(display.pattern)
+      ? display.pattern.join(", ")
+      : (display.pattern ?? "")
+    // LOUD log: kind + pattern/title + session only — never metadata/secrets.
+    console.log(
+      `[StreamHandler] ✅ AUTO-ALLOW permission ${permissionId} kind="${kind}" title="${String(display.title).slice(0, 200)}"` +
+      (patternStr ? ` pattern="${String(patternStr).slice(0, 200)}"` : "") +
+      ` session=${sessionId}`
+    )
+
+    let ok = false
+    try {
+      ok = await this.permissionAutoResponder(sessionId, permissionId, destination)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error(`[StreamHandler] Auto-allow responder threw for ${permissionId}: ${msg.slice(0, 120)}`)
+      ok = false
+    }
+
+    if (!ok) {
+      // LOUD fallback (H2 expired pattern): never leave the session blocked silently.
+      console.error(`[StreamHandler] Auto-allow failed for ${permissionId} (session ${sessionId}) — notifying topic to resend`)
+      try {
+        await this.sendCallback(
+          destination.chatId,
+          destination.topicId,
+          `⚠️ Permission request expired: the OpenCode session restarted and the pending approval can no longer be answered.\n\n` +
+          `Please resend your message.`,
+          { parseMode: "HTML" }
+        )
+      } catch { /* best-effort notice */ }
+      return true
+    }
+
+    // Success: remember (duplicate suppression, capped) + clear any raced
+    // card/timer like a manual allow, then a subtle (button-free) chat note.
+    this.autoAllowedPermissionIds.add(permissionId)
+    if (this.autoAllowedPermissionIds.size > 200) {
+      const oldest = this.autoAllowedPermissionIds.values().next().value
+      if (oldest !== undefined) this.autoAllowedPermissionIds.delete(oldest)
+    }
+    const raced = this.pendingPermissions.get(permissionId)
+    if (raced) {
+      if (raced.telegramMessageId) {
+        try {
+          await this.sendCallback(
+            raced.chatId,
+            raced.topicId,
+            `<i>Permission Approved (auto-allowed)</i>`,
+            { parseMode: "HTML", editMessageId: raced.telegramMessageId }
+          )
+        } catch { /* keep the original card on edit failure */ }
+      }
+      this.clearPermissionTimer(permissionId)
+      this.pendingPermissions.delete(permissionId)
+    }
+    try {
+      await this.sendCallback(
+        destination.chatId,
+        destination.topicId,
+        `✅ Auto-allowed <code>${this.escapeHtml(kind)}</code> — ${this.escapeHtml(String(display.title))}`,
+        { parseMode: "HTML" }
+      )
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error(`[StreamHandler] Auto-allow note send failed (${permissionId}): ${msg.slice(0, 120)}`)
+    }
+    return true
   }
 
   /**

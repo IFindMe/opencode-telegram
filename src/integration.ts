@@ -116,6 +116,29 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
   // found-existing, discovered, TUI, or external sessions.
   const systemPromptPending = new Set<string>()
 
+  // Task 04: per-topic burst-coalescing buffer. Design choice: DELAY-FIRST
+  // sliding window. The first message starts a ~10s timer instead of sending
+  // immediately; arrivals inside the window join newline-separated in arrival
+  // order and each arrival extends the window (slides expiry to now+10s);
+  // expiry sends exactly ONE prompt_async with the joined text. This is the
+  // only choice satisfying "N rapid messages -> ONE prompt_async" (send-first
+  // could never un-send message 1). Cost, accepted by the task: every message
+  // waits out the window (idle singles included — "no added latency beyond
+  // the window design"). Busy-session composition: arrivals while the session
+  // is in-flight append to the same buffer and flush at the next
+  // idle/abort-aware boundary (or the busy-retry timer below) — never lost,
+  // never reordered, never merged across topics (keyed by effectiveTopicId).
+  // Losslessness backstop: flush is ALWAYS timer-driven, so a missed idle
+  // event (error/crash/unregistered session) can delay but never strand text.
+  const COALESCE_WINDOW_MS = 10_000
+  const COALESCE_BUSY_RETRY_MS = 3_000
+  interface CoalescedBurst {
+    parts: string[]
+    chatId: number
+    timer?: ReturnType<typeof setTimeout>
+  }
+  const coalesceByTopic = new Map<number, CoalescedBurst>()
+
   // Shared Telegram send queue (task 03): bot-wide pacing (~25 msg/s, under
   // Telegram's ~30/s group budget) + the per-message edit floor, shared 429
   // backoff (honor retry-after +500ms), priority finals/cards/notices over
@@ -199,6 +222,51 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     deleteProgressOnComplete: true,
   })
 
+  // Task 05: permission allowlist wiring — matching kinds auto-answer "once"
+  // via this resolve chain (identical to the manual perm: branch below, so
+  // TUI/discovered/restarted sessions behave the same). Default-deny: the
+  // StreamHandler only calls this on explicit rule match; unknown kinds ask.
+  // Returns true when OpenCode accepted "once"; false when no client resolved
+  // or the call failed (StreamHandler then notifies loudly — never silent).
+  // Never sends chat messages here (StreamHandler owns the subtle/loud
+  // notices via the shared queue); logs carry ids only, never secrets.
+  streamHandler.setPermissionsAutoAllow(config.opencode.permissionsAutoAllow)
+  streamHandler.setPermissionAutoResponder(async (sessionId, permissionId, destination) => {
+    let client: OpenCodeClient | undefined
+    const instanceId = sessionToInstance.get(sessionId)
+    if (instanceId) {
+      client = clients.get(instanceId)
+    }
+    if (!client) {
+      const dest = streamHandler.getTelegramDestination(sessionId) ?? destination
+      if (dest) {
+        client = clients.get(`discovered_${dest.topicId}`)
+      }
+    }
+    if (!client) {
+      const topicInstance = instanceManager.getInstanceByTopic(destination.topicId)
+      if (topicInstance) {
+        client = clients.get(topicInstance.config.instanceId)
+      }
+      if (!client) {
+        client = clients.get(`discovered_${destination.topicId}`)
+      }
+    }
+    if (!client) {
+      console.error(`[Integration] Auto-allow: no client for session ${sessionId} (topic ${destination.topicId}, perm ${permissionId})`)
+      return false
+    }
+    try {
+      await client.respondToPermission(sessionId, permissionId, "once")
+      console.log(`[Integration] Auto-allowed permission ${permissionId} (session ${sessionId}) with "once"`)
+      return true
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      console.error(`[Integration] Auto-allow failed for perm ${permissionId} (session ${sessionId}): ${reason.slice(0, 120)}`)
+      return false
+    }
+  })
+
   // Create topic store for direct access
   const topicStore = new TopicStore(config.storage.topicDbPath)
 
@@ -212,6 +280,11 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     if (tracked && tracked.sessionId === sessionId) {
       lastPromptByTopic.delete(topicId)
     }
+    // Task 04: turn boundary — flush text buffered while the session was busy
+    // as ONE joined prompt (the next turn). Fire-and-forget: flush is
+    // busy-gated + take-and-delete, so a stray trigger cannot double-send.
+    // Awaited callers below (topic-name update) are unaffected on no-op.
+    void flushCoalescedTopic(topicId)
     // Only update once per session
     if (topicNamesUpdated.has(sessionId)) {
       return
@@ -655,6 +728,106 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     }
   })
 
+  // Task 04: true when the topic's session has a turn in-flight (busy).
+  // Resolves via mapping first, then the topic's current managed instance
+  // (covers mapping-sessionId-stale races). Never throws — unknown means idle
+  // so the timer path still delivers.
+  function isTopicSessionBusy(chatId: number, topicId: number): boolean {
+    try {
+      const mapping = topicStore.getMapping(chatId, topicId)
+      if (mapping?.sessionId && streamHandler.isProcessing(mapping.sessionId)) {
+        return true
+      }
+      const topicInstance = instanceManager.getInstanceByTopic(topicId)
+      if (topicInstance?.sessionId && streamHandler.isProcessing(topicInstance.sessionId)) {
+        return true
+      }
+    } catch {
+      // Ignore lookup errors — treat as idle, timer path delivers.
+    }
+    return false
+  }
+
+  // Task 04: drop a topic's buffered burst (timer + parts). Called on topic
+  // cleanup paths (disconnect/stale-cleanup) where the destination is gone.
+  function clearCoalesceBuffer(topicId: number): void {
+    const burst = coalesceByTopic.get(topicId)
+    if (!burst) return
+    if (burst.timer) clearTimeout(burst.timer)
+    coalesceByTopic.delete(topicId)
+  }
+
+  // Task 04: flush one topic's buffer as ONE joined prompt_async via the
+  // existing router below (which owns echo guard, system-prompt injection,
+  // lastPromptByTopic, and 429-safe send — all preserved untouched).
+  // Busy gate: while the session is in-flight, keep buffering and re-arm a
+  // short retry so a missed idle event can never strand text. Take-and-delete
+  // is synchronous, so concurrent timer/idle/abort triggers cannot double-send.
+  async function flushCoalescedTopic(topicId: number): Promise<void> {
+    const burst = coalesceByTopic.get(topicId)
+    if (!burst || burst.parts.length === 0) return
+    if (isTopicSessionBusy(burst.chatId, topicId)) {
+      if (burst.timer) clearTimeout(burst.timer)
+      burst.timer = setTimeout(() => void flushCoalescedTopic(topicId), COALESCE_BUSY_RETRY_MS)
+      return
+    }
+    const joined = burst.parts.join("\n")
+    const chatId = burst.chatId
+    if (burst.timer) clearTimeout(burst.timer)
+    coalesceByTopic.delete(topicId)
+    try {
+      // Joined text flows through the unchanged router, so its existing
+      // markMessageFromTelegram(sessionId, text) sites cover the JOINED text.
+      await routeMessageToInstance({
+        messageId: 0,
+        chatId,
+        topicId,
+        userId: 0,
+        text: joined,
+        isGeneralTopic: topicId === 0,
+        isReply: false,
+      })
+    } catch (error) {
+      // The router posts its own error notice to the topic on failure (same
+      // as today's single-send semantics: user resends). Log lengths only —
+      // never message text (secrets).
+      const reason = error instanceof Error ? error.message : String(error)
+      console.error(`[Integration] Coalesced flush failed for topic ${topicId} (len=${joined.length}): ${reason.slice(0, 120)}`)
+    }
+  }
+
+  // Task 04: coalescing entry point — per-topic sliding window + busy hold.
+  // Same signature as the router; returns success-pending (response arrives
+  // via SSE as today). Callers only use success/error/isNewSession.
+  async function routeMessageToInstanceCoalesced(
+    context: ForumMessageContext
+  ): Promise<MessageRouteResult> {
+    const { chatId, topicId, text } = context
+    const effectiveTopicId = context.isGeneralTopic ? 0 : topicId
+    const busy = isTopicSessionBusy(chatId, effectiveTopicId)
+    let burst = coalesceByTopic.get(effectiveTopicId)
+    if (!burst) {
+      burst = { parts: [], chatId }
+      coalesceByTopic.set(effectiveTopicId, burst)
+    }
+    // Chronological append — order is arrival order, never reordered, and
+    // buffers are keyed per topic so text can never leak across topics.
+    burst.parts.push(text)
+    burst.chatId = chatId
+    if (burst.timer) clearTimeout(burst.timer)
+    // Idle: sliding ~10s window (each arrival extends). Busy: hold for the
+    // next idle/abort boundary, with a short retry backstop (see flush).
+    burst.timer = setTimeout(
+      () => void flushCoalescedTopic(effectiveTopicId),
+      busy ? COALESCE_BUSY_RETRY_MS : COALESCE_WINDOW_MS
+    )
+    // Permission/cancel interplay: buffering never touches permission cards
+    // (posted independently by the stream handler) and never blocks /cancel
+    // (handleCancelRequest aborts the turn, then flushes promptly — see below).
+    const mapping = topicStore.getMapping(chatId, effectiveTopicId)
+    return { success: true, sessionId: mapping?.sessionId }
+  }
+
   // Custom message router that uses our instances
   async function routeMessageToInstance(
     context: ForumMessageContext
@@ -958,9 +1131,11 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
 
   // Override topic manager's routeMessage to use our custom router
   // We need to monkey-patch this since the original expects ForumMessageContext
+  // Task 04: entry is the coalescing wrapper (per-topic ~10s window + busy
+  // hold); it flushes through routeMessageToInstance with the JOINED text.
   const originalRouteMessage = topicManager.routeMessage.bind(topicManager)
   topicManager.routeMessage = async (context: ForumMessageContext): Promise<MessageRouteResult> => {
-    return routeMessageToInstance(context)
+    return routeMessageToInstanceCoalesced(context)
   }
 
   // Helper to get all active sessions (managed + external + discovered)
@@ -1243,6 +1418,9 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
         streamHandler.unregisterSession(mapping.sessionId)
       }
 
+      // Task 04: destination is gone — drop any buffered burst for the topic.
+      clearCoalesceBuffer(topicId)
+
       // Delete the topic mapping
       topicStore.deleteMapping(chatId, topicId)
 
@@ -1288,6 +1466,9 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
       if (mapping.sessionId) {
         streamHandler.unregisterSession(mapping.sessionId)
       }
+
+      // Task 04: topic is going away — drop any buffered burst for it.
+      clearCoalesceBuffer(topicId)
 
       // Delete the topic mapping
       topicStore.deleteMapping(chatId, topicId)
@@ -1547,6 +1728,10 @@ export async function createIntegratedApp(config: AppConfig): Promise<Integrated
     }
 
     streamHandler.markAborted(sessionId)
+    // Task 04: abort-aware boundary — buffered text survives the abort; flush
+    // promptly as ONE joined prompt (the next turn) instead of waiting out
+    // the window. Permission cards are untouched (stream-handler-owned).
+    void flushCoalescedTopic(topicId)
     const message = "⏹ Cancelled — session still active, send a new message."
     await sendToTopic(bot, chatId, topicId, message)
     return { ok: true, message }
