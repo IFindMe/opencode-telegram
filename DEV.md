@@ -11,6 +11,7 @@ Integration. End-user setup and bot commands live in [README.md](README.md).
 - [API Reference](#api-reference)
 - [Development](#development)
 - [Streaming and SSE Internals](#streaming-and-sse-internals)
+- [Runtime Behavior Notes](#runtime-behavior-notes)
 - [Testing Notes](#testing-notes)
 - [Docker Details](#docker-details)
 - [Contributing](#contributing)
@@ -110,6 +111,9 @@ Runtime state (gitignored) lives in `data/`:
 | `OPENCODE_IDLE_TIMEOUT_MS` | No | `1800000` | Idle timeout (30 min) |
 | `OPENCODE_HEALTH_CHECK_INTERVAL_MS` | No | `30000` | Health check interval (30 s) |
 | `OPENCODE_STARTUP_TIMEOUT_MS` | No | `60000` | Instance startup timeout (60 s) |
+| `STREAM_UPDATE_INTERVAL_MS` | No | `1000` | Min interval between progress-message edits in ms (clamped 500–5000) |
+| `TELEGRAM_SEND_INTERVAL_MS` | No | `40` | Bot-wide floor between Telegram API calls in ms, ≈25 msg/s (clamped 10–1000) |
+| `PERMISSIONS_AUTO_ALLOW` | No | `read,glob,grep,list,lsp` | Permission kinds auto-approved with "once" (CSV, case-insensitive; empty = approve nothing; unknown kinds always ask) |
 | `ORCHESTRATOR_DB_PATH` | No | `./data/orchestrator.db` | Instance state database |
 | `TOPIC_DB_PATH` | No | `./data/topics.db` | Topic mapping database |
 | `API_PORT` | No | `4200` | External API server port |
@@ -234,6 +238,55 @@ Summary of how a prompt becomes streamed Telegram messages (see
 5. On crash/restart, `instance:ready` re-subscribes and may create a new
    session; if the previous prompt had produced activity, the topic gets a
    "resend your message" nudge — accepted prompts are never silently dropped.
+
+## Runtime Behavior Notes
+
+Concise operator/developer reference for recently shipped behavior. Source:
+`AgentsReport/builder/2026-09-19_*.md`.
+
+- **Startup duplicate-bot guard.** The bot takes a lockfile (`data/bot.lock`)
+  before polling; a second copy refuses to start with an error naming the
+  live PID and lockfile path, exiting 1. A dead PID is taken over; only the
+  owning process releases the lock. A Telegram `409 Conflict` at startup
+  means two pollers on one token — kill the duplicate, don't restart yours.
+- **Send pacing.** All sends/edits flow through one shared queue: a bot-wide
+  floor (`TELEGRAM_SEND_INTERVAL_MS`, default 40 ms) plus a per-message edit
+  floor (`STREAM_UPDATE_INTERVAL_MS`). Final answers, cards, and notices are
+  never dropped (wait + bounded retry, then caller fallbacks); only progress
+  edits may be shed under pressure, and the trailing flush re-delivers the tail.
+  Telegram `429`s back off queue-wide by `retry-after` + cushion.
+- **Burst coalescing.** Each topic buffers inbound messages in a ~10 s
+  sliding window: rapid messages merge into ONE prompt (newline-joined,
+  arrival order, per-topic isolation). Every message waits out the window;
+  while the session is busy the flush holds and retries every ~3 s, and
+  pending text also flushes at turn-idle or on cancel (as the next turn).
+  Retry taps bypass the window deliberately.
+- **Permission allowlist.** `PERMISSIONS_AUTO_ALLOW` (default
+  `read,glob,grep,list,lsp`) auto-answers matching permission requests with
+  `"once"` — loud server log plus a subtle in-chat note, turn continues, no
+  card. Everything else (writes, exec, network, `external_directory`,
+  unknown kinds) keeps the approve/deny card with its 5-minute reminder.
+  Set-but-empty means approve nothing. Auto-allow API failure posts a loud
+  resend notice, never silence.
+- **Cancel.** The Cancel button on progress cards and `/cancel` in a topic
+  abort the in-flight turn (`abortSession`), reset progress state, and post
+  exactly one confirmation; the session stays registered and usable. Tapping
+  with nothing in flight gets a polite no-op notice. Cancel never unregisters
+  the session.
+- **Interactive cards.** Errors, crashes, SSE loss, and idle timeout post
+  notices with **Retry** (resends the last prompt; busy/stale/expired taps
+  are refused safely) and **Restart/Reconnect** (one-tap fresh session via
+  the normal ready path; no-op if already running) buttons. A typing
+  indicator heartbeats while a turn is active. Truncated finals get a **Full
+  output** toggle (expand/collapse, bounded store); finals with tool activity
+  add a threaded reply with per-tool lines and a tools/time/tokens footer.
+  Progress cards cap at 8 tool lines with a "+N more" note.
+- **Topic retention (no auto-cleanup).** Automatic stale-topic deletion was
+  removed: nothing deletes topics on its own, and the `STALE_TOPIC_*`
+  settings no longer exist (if set, they are silently ignored). Replacement:
+  nothing automatic — use manual `/clear` in General (drops mappings whose
+  sessions are gone) or `/disconnect` in a topic. Instance idle timeout is
+  unchanged (it stops idle *instances*, not topics).
 
 ## Testing Notes
 

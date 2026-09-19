@@ -62,6 +62,7 @@ DRY_RUN="false"
 ASSUME_YES="false"
 SHOW_HELP="false"
 ALLOW_ROOT="false"
+FORCE="false"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -152,8 +153,16 @@ Options:
                       or --dry-run). Without --yes nothing is ever deleted.
   --dry-run           Print every mutation that would happen; change nothing.
   --allow-root        Permit running as root (containers without a login
-                      user only). Without it, running as root aborts: a
-                      user-space install into /root is almost never wanted.
+                        user only). Without it, running as root aborts: a
+                        user-space install into /root is almost never wanted.
+  --force               Install even if a legacy system-wide unit
+                        (/etc/systemd/system/opencode-telegram.service, or an
+                        active/enabled system instance) is still present.
+                        Without --force the installer aborts there: two bots
+                        on one Telegram token fight (409 conflicts, stolen
+                        updates, lost messages). Remove the old unit first
+                        (the abort message gives the exact commands); pass
+                        --force only once it is stopped, disabled, removed.
   --help, -h          Show this help and exit.
 
 Removed flags (abort with an error if passed):
@@ -222,6 +231,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN="true"; shift ;;
     --yes|-y) ASSUME_YES="true"; shift ;;
     --allow-root) ALLOW_ROOT="true"; shift ;;
+    --force) FORCE="true"; shift ;;
     --help|-h) SHOW_HELP="true"; shift ;;
     --) shift; break ;;
     -*) die "Unknown flag: $1 (see --help)." ;;
@@ -304,6 +314,72 @@ note_stale_leftover() {
     warn "Stale leftover from an old system-mode install is not removable as '$(id -un)': $path"
     log "  To remove it yourself, run: $remediation"
   fi
+}
+
+# legacy_system_present — read-only probe for a legacy system-wide install.
+# Exits 0 when the old system unit file exists at $LEGACY_SYSTEM_UNIT or a
+# system instance is active/enabled; exits 1 otherwise. Never uses sudo and
+# never touches /etc or /opt: `test -e` needs no privilege, and `systemctl
+# is-active`/`is-enabled` (system scope, no --user) are read-only queries.
+legacy_system_present() {
+  if [[ -e "$LEGACY_SYSTEM_UNIT" ]]; then
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+      return 0
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# guard_legacy_system_unit — preflight abort when a legacy system-wide unit
+# is still present. Installing the per-user bot while the old system bot is
+# still around would run TWO bots on the same Telegram token (Telegram serves
+# getUpdates to one poller, so the bots fight: HTTP 409 conflicts, stolen
+# updates, vanishing messages) — so abort unless --force is given. With
+# --force, fall through to the existing read-only stale-leftover report and
+# continue, nothing more. Read-only either way: never sudo, never touches
+# /etc or /opt.
+guard_legacy_system_unit() {
+  local present="false"
+  if legacy_system_present; then
+    present="true"
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf '[dry-run] would check legacy system unit (read-only): %s\n' "$LEGACY_SYSTEM_UNIT"
+    printf '[dry-run] would check legacy system state (read-only): systemctl is-active/is-enabled %s\n' "$SERVICE_NAME"
+    if [[ "$present" == "true" ]]; then
+      if [[ "$FORCE" == "true" ]]; then
+        printf '[dry-run] legacy system unit detected — would warn (read-only report) but proceed (--force given).\n'
+      else
+        printf '[dry-run] legacy system unit detected — would abort (re-run with --force to override).\n'
+      fi
+    else
+      printf '[dry-run] no legacy system unit detected — would proceed.\n'
+    fi
+    return 0
+  fi
+  if [[ "$present" != "true" ]]; then
+    return 0
+  fi
+  if [[ "$FORCE" == "true" ]]; then
+    warn "Legacy system-wide ${SERVICE_NAME} install still present — proceeding only because --force was given. Two bots on one Telegram token fight (409 conflicts) and lose messages; remove the old unit as soon as possible."
+    note_stale_leftover "$LEGACY_SYSTEM_UNIT" "sudo rm -f ${LEGACY_SYSTEM_UNIT} && sudo systemctl daemon-reload"
+    note_stale_leftover "$LEGACY_SYSTEM_PREFIX" "sudo rm -rf ${LEGACY_SYSTEM_PREFIX}"
+    return 0
+  fi
+  printf 'ERROR: Refusing to install: a legacy system-wide %s install is still present (unit file %s exists, or the system instance is active/enabled).\n' "$SERVICE_NAME" "$LEGACY_SYSTEM_UNIT" >&2
+  printf 'ERROR: Installing now would run TWO bots on the same Telegram token: the bots fight over updates (HTTP 409 conflicts), steal updates from each other, and messages vanish.\n' >&2
+  printf 'ERROR: Remove the old system install first, then re-run without --force:\n' >&2
+  printf 'ERROR:   sudo systemctl disable --now %s\n' "$SERVICE_NAME" >&2
+  printf 'ERROR:   sudo rm -f %s && sudo systemctl daemon-reload\n' "$LEGACY_SYSTEM_UNIT" >&2
+  printf 'ERROR:   sudo rm -rf %s\n' "$LEGACY_SYSTEM_PREFIX" >&2
+  printf 'ERROR: Pass --force only once the old system unit is fully stopped, disabled, and removed.\n' >&2
+  exit 1
 }
 
 do_uninstall() {
@@ -572,6 +648,11 @@ enable_and_check() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# Preflight (before any copy): refuse to install alongside a live legacy
+# system-wide unit — two bots on one token means 409 conflicts and lost
+# messages — unless --force explicitly overrides.
+guard_legacy_system_unit
 
 copy_runtime_files
 install_deps

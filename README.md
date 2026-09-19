@@ -204,10 +204,24 @@ These commands work inside individual topic threads:
 | Command | Description |
 |---------|-------------|
 | `/session` | Show current topic's OpenCode session info |
+| `/cancel` | Stop the in-flight reply (session stays active, just send again) |
 | `/link <path>` | Link topic to existing project directory |
 | `/stream` | Toggle real-time streaming on/off |
 | `/disconnect` | Disconnect session and delete topic |
 | `/help` | Show context-aware help |
+
+### Interactive replies
+
+Replies carry inline buttons: **Approve / Deny** on permission cards,
+**Cancel** on in-progress replies (same as `/cancel`), plus **Retry** and
+**Full output** where relevant. Long answers collapse with a button for the
+rest, and tool activity shows as a compact threaded summary.
+Read-only requests (file reads, search, listing) are approved automatically —
+only writes, commands, and network access ask. If you send several messages
+quickly, they merge into a single reply.
+
+Topics are never auto-deleted: use `/disconnect` inside a topic to remove it,
+or `/clear` in General to drop mappings whose sessions are gone.
 
 ### Session Discovery
 

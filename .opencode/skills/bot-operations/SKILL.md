@@ -70,8 +70,12 @@ A healthy bot answers the API health endpoint and shows active instances via
 - `bash scripts/install.sh` — user-space-only install (default prefix
   `~/.local/share/opencode-telegram`; no root, no sudo, no `/opt`).
 - `bash scripts/install.sh --help` — all flags (`--prefix`, `--env-from`,
-  `--non-interactive`, `--uninstall`/`--yes`, `--dry-run`, `--allow-root`).
-  Old `--system` / `--user NAME` flags abort — re-run without them.
+  `--non-interactive`, `--uninstall`/`--yes`, `--dry-run`, `--allow-root`,
+  `--force`). Old `--system` / `--user NAME` flags abort — re-run without them.
+- The installer aborts BEFORE copying anything if a legacy system-wide unit
+  is present (`/etc/systemd/system/opencode-telegram.service` exists, or it
+  is active/enabled) — unless `--force` is passed, which warns and proceeds.
+  If it aborts, migrate first (one-liners below), then re-run.
 - `bash scripts/install.sh --uninstall` — remove unit (keeps installed files
   unless `--yes` plus typed `DELETE` confirmation).
 - Migrating off an old system-wide install: keep exactly ONE service per
@@ -79,16 +83,38 @@ A healthy bot answers the API health endpoint and shows active instances via
   then `sudo systemctl disable --now opencode-telegram.service`,
   `sudo rm -f /etc/systemd/system/opencode-telegram.service && sudo systemctl daemon-reload`,
   `sudo rm -rf /opt/opencode-telegram` (deletes its data/ — back up first).
+- Tuning knobs in `.env`: `TELEGRAM_SEND_INTERVAL_MS` (default 40 — bot-wide
+  floor between Telegram API calls), `STREAM_UPDATE_INTERVAL_MS` (default
+  1000 — min interval between progress-message edits), `PERMISSIONS_AUTO_ALLOW`
+  (default `read,glob,grep,list,lsp` — permission kinds auto-approved with
+  "once"; empty = approve nothing; unknown kinds always ask).
+
+## In-chat ops (/cancel, topic retention)
+
+- `/cancel` (or the Cancel button on a progress card) stops the in-flight
+  turn; the session stays active, just send again. Tapping with nothing in
+  flight gets a polite no-op notice — not an error state.
+- Topics are NEVER auto-deleted (no automatic stale cleanup exists). `/clear`
+  in General drops mappings whose sessions are gone; `/disconnect` in a topic
+  unlinks and deletes that topic. Instance idle timeout stops idle instances
+  only, never topics.
 
 ## Stale / duplicate processes
 
 Two bot copies polling Telegram cause `409 Conflict` errors and flapping
-behavior. Exactly one bot owner must exist per token:
+behavior. Exactly one bot owner must exist per token. The bot self-guards:
+it takes a lockfile (`data/bot.lock`) at startup and a second copy exits 1
+naming the live PID — so if a start fails with a duplicate-bot/lock error,
+find that PID first instead of forcing a new copy:
 
 ```bash
 ps aux | grep -E "bun|opencode-telegram" | grep -v grep
 lsof -ti:4200   # API port holder should be the live bot
 ```
+
+A `409 Conflict` / "terminated by other getUpdates" at startup always means
+a second poller on the same token (stale systemd unit, old Docker container,
+second dev shell) — kill the duplicate, don't restart yours.
 
 OpenCode instances occupy ports from `4100` up (`OPENCODE_PORT_START`,
 pool size `OPENCODE_PORT_POOL_SIZE`). A stale holder blocks restarts:
