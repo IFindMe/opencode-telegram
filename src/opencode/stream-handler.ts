@@ -247,6 +247,7 @@ export class StreamHandler {
         await this.handleSessionUpdated(sessionId, event, destination)
         break
 
+      case "permission.asked":
       case "permission.updated":
         await this.handlePermissionUpdated(event, destination)
         break
@@ -749,8 +750,15 @@ export class StreamHandler {
     destination: { chatId: number; topicId: number }
   ): Promise<void> {
     // Defensively unwrap: live envelope may nest the permission object.
+    // NOTE: the live `permission.asked` flat shape carries a STRING field
+    // `permission` (e.g. "external_directory"), so a naive
+    // `raw.permission ?? raw` unwrap would yield that string instead of the
+    // object. Only unwrap when nested value is actually an object.
     const raw = event.properties as Record<string, any>
-    const candidate = (raw?.permission ?? raw) as Partial<Permission> & Record<string, any>
+    const nested = raw?.permission
+    const candidate = (
+      nested && typeof nested === "object" ? nested : raw
+    ) as Partial<Permission> & Record<string, any>
     const permission = candidate as Permission
 
     if (!permission || typeof permission.id !== "string" || !permission.id) {
@@ -779,10 +787,32 @@ export class StreamHandler {
       return
     }
 
-    console.log(`[StreamHandler] Permission request: ${permission.type} - ${permission.title}`)
+    // Live `permission.asked` flat shape uses `permission` (kind string) and
+    // `patterns` where Permission uses `type`/`pattern`/`title`. Coalesce so
+    // the card renders — critically, formatPermissionMessage calls escapeHtml
+    // on type/title, which would throw on undefined and leave the session
+    // blocked with no card. No mutation of the stored shape beyond display.
+    const kind =
+      permission.type ??
+      (typeof raw.permission === "string" ? raw.permission : undefined) ??
+      "unknown"
+    const flatPattern = (raw.patterns ?? raw.pattern) as unknown
+    const displayTitle =
+      permission.title ??
+      (kind !== "unknown" ? `${kind} access request` : "Permission request")
+    const display: Permission = {
+      ...permission,
+      type: kind,
+      title: displayTitle,
+      ...(flatPattern !== undefined && permission.pattern === undefined
+        ? { pattern: flatPattern as string | string[] }
+        : {}),
+    }
+
+    console.log(`[StreamHandler] Permission request (${event.type}): ${display.type} - ${display.title}`)
 
     // Format permission message
-    const messageText = this.formatPermissionMessage(permission)
+    const messageText = this.formatPermissionMessage(display)
 
     // Create inline keyboard with approve/deny buttons
     const keyboard: InlineKeyboardButton[][] = [
@@ -794,6 +824,34 @@ export class StreamHandler {
         { text: "❌ Deny", callback_data: `perm:reject:${permission.id}` },
       ],
     ]
+
+    // Defensive dedupe: `.asked` and `.updated` may both fire for one request.
+    // Refresh the stored entry and edit the existing card in place — never
+    // post a second card. If no card was ever posted, skip resend (the
+    // reminder/validation paths already cover loud fallback).
+    const existing = this.pendingPermissions.get(permission.id)
+    if (existing) {
+      existing.permission = display
+      if (existing.telegramMessageId) {
+        try {
+          await this.sendCallback(
+            existing.chatId,
+            existing.topicId,
+            messageText,
+            {
+              parseMode: "HTML",
+              inlineKeyboard: keyboard,
+              editMessageId: existing.telegramMessageId,
+            }
+          )
+        } catch {
+          // Keep the original card; edit failures must not duplicate it.
+        }
+      }
+      this.clearPermissionTimer(permission.id)
+      this.schedulePermissionReminder(permission.id)
+      return
+    }
 
     try {
       const result = await this.sendCallback(
@@ -809,7 +867,7 @@ export class StreamHandler {
       // Store pending permission for later resolution + schedule one reminder (H2)
       this.clearPermissionTimer(permission.id)
       this.pendingPermissions.set(permission.id, {
-        permission,
+        permission: display,
         telegramMessageId: result.messageId,
         chatId: destination.chatId,
         topicId: destination.topicId,

@@ -296,6 +296,15 @@ export interface PermissionUpdatedEvent {
 }
 
 /**
+ * Permission asked event - initial permission request from OpenCode
+ * (live OpenCode 1.18.x emits this; same payload shape as permission.updated)
+ */
+export interface PermissionAskedEvent {
+  type: "permission.asked"
+  properties: Permission
+}
+
+/**
  * Permission replied event - confirmation that permission was processed
  */
 export interface PermissionRepliedEvent {
@@ -321,6 +330,7 @@ export type SSEEvent =
   | ToolResultEvent
   | FileEditedEvent
   | PermissionUpdatedEvent
+  | PermissionAskedEvent
   | PermissionRepliedEvent
   | BaseSSEEvent // Fallback for unknown events
 
